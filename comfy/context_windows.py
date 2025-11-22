@@ -51,24 +51,18 @@ class ContextHandlerABC(ABC):
 
 
 class IndexListContextWindow(ContextWindowABC):
-    def __init__(self, index_list: list[int], dim: int=0, total_frames: int=0):
+    def __init__(self, index_list: list[int], dim: int=0):
         self.index_list = index_list
         self.context_length = len(index_list)
         self.dim = dim
-        self.total_frames = total_frames
-        self.center_ratio = (min(index_list) + max(index_list)) / (2 * total_frames)
 
-    def get_tensor(self, full: torch.Tensor, device=None, dim=None, retain_index_list=[]) -> torch.Tensor:
+    def get_tensor(self, full: torch.Tensor, device=None, dim=None) -> torch.Tensor:
         if dim is None:
             dim = self.dim
         if dim == 0 and full.shape[dim] == 1:
             return full
         idx = tuple([slice(None)] * dim + [self.index_list])
-        window = full[idx]
-        if retain_index_list:
-            idx = tuple([slice(None)] * dim + [retain_index_list])
-            window[idx] = full[idx]
-        return window.to(device)
+        return full[idx].to(device)
 
     def add_window(self, full: torch.Tensor, to_add: torch.Tensor, dim=None) -> torch.Tensor:
         if dim is None:
@@ -77,17 +71,12 @@ class IndexListContextWindow(ContextWindowABC):
         full[idx] += to_add
         return full
 
-    def get_region_index(self, num_regions: int) -> int:
-        region_idx = int(self.center_ratio * num_regions)
-        return min(max(region_idx, 0), num_regions - 1)
-
 
 class IndexListCallbacks:
     EVALUATE_CONTEXT_WINDOWS = "evaluate_context_windows"
     COMBINE_CONTEXT_WINDOW_RESULTS = "combine_context_window_results"
     EXECUTE_START = "execute_start"
     EXECUTE_CLEANUP = "execute_cleanup"
-    RESIZE_COND_ITEM = "resize_cond_item"
 
     def init_callbacks(self):
         return {}
@@ -105,8 +94,7 @@ class ContextFuseMethod:
 
 ContextResults = collections.namedtuple("ContextResults", ['window_idx', 'sub_conds_out', 'sub_conds', 'window'])
 class IndexListContextHandler(ContextHandlerABC):
-    def __init__(self, context_schedule: ContextSchedule, fuse_method: ContextFuseMethod, context_length: int=1, context_overlap: int=0, context_stride: int=1,
-                 closed_loop: bool=False, dim:int=0, freenoise: bool=False, cond_retain_index_list: list[int]=[], split_conds_to_windows: bool=False):
+    def __init__(self, context_schedule: ContextSchedule, fuse_method: ContextFuseMethod, context_length: int=1, context_overlap: int=0, context_stride: int=1, closed_loop: bool=False, dim:int=0, freenoise: bool=False):
         self.context_schedule = context_schedule
         self.fuse_method = fuse_method
         self.context_length = context_length
@@ -116,8 +104,6 @@ class IndexListContextHandler(ContextHandlerABC):
         self.dim = dim
         self._step = 0
         self.freenoise = freenoise
-        self.cond_retain_index_list = [int(x.strip()) for x in cond_retain_index_list.split(",")] if cond_retain_index_list else []
-        self.split_conds_to_windows = split_conds_to_windows
 
         self.callbacks = {}
 
@@ -125,8 +111,6 @@ class IndexListContextHandler(ContextHandlerABC):
         # for now, assume first dim is batch - should have stored on BaseModel in actual implementation
         if x_in.size(self.dim) > self.context_length:
             logging.info(f"Using context windows {self.context_length} with overlap {self.context_overlap} for {x_in.size(self.dim)} frames.")
-            if self.cond_retain_index_list:
-                logging.info(f"Retaining original cond for indexes: {self.cond_retain_index_list}")
             return True
         return False
 
@@ -140,11 +124,6 @@ class IndexListContextHandler(ContextHandlerABC):
             return None
         # reuse or resize cond items to match context requirements
         resized_cond = []
-        # if multiple conds, split based on primary region
-        if self.split_conds_to_windows and len(cond_in) > 1:
-            region = window.get_region_index(len(cond_in))
-            logging.info(f"Splitting conds to windows; using region {region} for window {window.index_list[0]}-{window.index_list[-1]} with center ratio {window.center_ratio:.3f}")
-            cond_in = [cond_in[region]]
         # cond object is a list containing a dict - outer list is irrelevant, so just loop through it
         for actual_cond in cond_in:
             resized_actual_cond = actual_cond.copy()
@@ -167,38 +146,15 @@ class IndexListContextHandler(ContextHandlerABC):
                         new_cond_item = cond_item.copy()
                         # when in dictionary, look for tensors and CONDCrossAttn [comfy/conds.py] (has cond attr that is a tensor)
                         for cond_key, cond_value in new_cond_item.items():
-                            # Allow callbacks to handle custom conditioning items
-                            handled = False
-                            for callback in comfy.patcher_extension.get_all_callbacks(
-                                IndexListCallbacks.RESIZE_COND_ITEM, self.callbacks
-                            ):
-                                result = callback(cond_key, cond_value, window, x_in, device, new_cond_item)
-                                if result is not None:
-                                    new_cond_item[cond_key] = result
-                                    handled = True
-                                    break
-                            if handled:
-                                continue
                             if isinstance(cond_value, torch.Tensor):
                                 if (self.dim < cond_value.ndim and cond_value(self.dim) == x_in.size(self.dim)) or \
                                    (cond_value.ndim < self.dim and cond_value.size(0) == x_in.size(self.dim)):
                                     new_cond_item[cond_key] = window.get_tensor(cond_value, device)
-                            # Handle audio_embed (temporal dim is 1)
-                            elif cond_key == "audio_embed" and hasattr(cond_value, "cond") and isinstance(cond_value.cond, torch.Tensor):
-                                audio_cond = cond_value.cond
-                                if audio_cond.ndim > 1 and audio_cond.size(1) == x_in.size(self.dim):
-                                    new_cond_item[cond_key] = cond_value._copy_with(window.get_tensor(audio_cond, device, dim=1))
-                            # Handle vace_context (temporal dim is 3)
-                            elif cond_key == "vace_context" and hasattr(cond_value, "cond") and isinstance(cond_value.cond, torch.Tensor):
-                                vace_cond = cond_value.cond
-                                if vace_cond.ndim >= 4 and vace_cond.size(3) == x_in.size(self.dim):
-                                    sliced_vace = window.get_tensor(vace_cond, device, dim=3, retain_index_list=self.cond_retain_index_list)
-                                    new_cond_item[cond_key] = cond_value._copy_with(sliced_vace)
                             # if has cond that is a Tensor, check if needs to be subset
                             elif hasattr(cond_value, "cond") and isinstance(cond_value.cond, torch.Tensor):
                                 if  (self.dim < cond_value.cond.ndim and cond_value.cond.size(self.dim) == x_in.size(self.dim)) or \
                                     (cond_value.cond.ndim < self.dim and cond_value.cond.size(0) == x_in.size(self.dim)):
-                                    new_cond_item[cond_key] = cond_value._copy_with(window.get_tensor(cond_value.cond, device, retain_index_list=self.cond_retain_index_list))
+                                    new_cond_item[cond_key] = cond_value._copy_with(window.get_tensor(cond_value.cond, device))
                             elif cond_key == "num_video_frames": # for SVD
                                 new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond)
                                 new_cond_item[cond_key].cond = window.context_length
@@ -211,7 +167,7 @@ class IndexListContextHandler(ContextHandlerABC):
         return resized_cond
 
     def set_step(self, timestep: torch.Tensor, model_options: dict[str]):
-        mask = torch.isclose(model_options["transformer_options"]["sample_sigmas"], timestep[0], rtol=0.0001)
+        mask = torch.isclose(model_options["transformer_options"]["sample_sigmas"], timestep, rtol=0.0001)
         matches = torch.nonzero(mask)
         if torch.numel(matches) == 0:
             raise Exception("No sample_sigmas matched current timestep; something went wrong.")
@@ -220,7 +176,7 @@ class IndexListContextHandler(ContextHandlerABC):
     def get_context_windows(self, model: BaseModel, x_in: torch.Tensor, model_options: dict[str]) -> list[IndexListContextWindow]:
         full_length = x_in.size(self.dim) # TODO: choose dim based on model
         context_windows = self.context_schedule.func(full_length, self, model_options)
-        context_windows = [IndexListContextWindow(window, dim=self.dim, total_frames=full_length) for window in context_windows]
+        context_windows = [IndexListContextWindow(window, dim=self.dim) for window in context_windows]
         return context_windows
 
     def execute(self, calc_cond_batch: Callable, model: BaseModel, conds: list[list[dict]], x_in: torch.Tensor, timestep: torch.Tensor, model_options: dict[str]):
@@ -343,7 +299,7 @@ def _sampler_sample_wrapper(executor, guider, sigmas, extra_args, callback, nois
         raise Exception("context_handler not found in sampler_sample_wrapper; this should never happen, something went wrong.")
     if not handler.freenoise:
         return executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
-    noise = apply_freenoise(noise, handler.dim, handler.context_length, handler.context_overlap, extra_args["seed"])
+    noise = apply_freenoise(noise, handler.context_length, handler.context_overlap, extra_args["seed"])
 
     return executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
 
@@ -608,28 +564,25 @@ def shift_window_to_end(window: list[int], num_frames: int):
         # 2) add end_delta to each val to slide windows to end
         window[i] = window[i] + end_delta
 
-
 # https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved/blob/90fb1331201a4b29488089e4fbffc0d82cc6d0a9/animatediff/sample_settings.py#L465
-def apply_freenoise(noise: torch.Tensor, dim: int, context_length: int, context_overlap: int, seed: int):
-    logging.info("Context windows: Applying FreeNoise")
-    generator = torch.Generator(device='cpu').manual_seed(seed)
-    latent_video_length = noise.shape[dim]
+def apply_freenoise(noise: torch.Tensor, context_length: int, context_overlap: int, seed: int):
+    logging.info(f"Context windows: Applying FreeNoise")
+    generator = torch.manual_seed(seed)
+    latent_video_length = noise.shape[2]
     delta = context_length - context_overlap
-
-    for start_idx in range(0, latent_video_length - context_length, delta):
+    for start_idx in range(0, latent_video_length-context_length, delta):
         place_idx = start_idx + context_length
-
-        actual_delta = min(delta, latent_video_length - place_idx)
-        if actual_delta <= 0:
+        if place_idx >= latent_video_length:
             break
+        end_idx = place_idx - 1
 
-        list_idx = torch.randperm(actual_delta, generator=generator, device='cpu') + start_idx
-
-        source_slice = [slice(None)] * noise.ndim
-        source_slice[dim] = list_idx
-        target_slice = [slice(None)] * noise.ndim
-        target_slice[dim] = slice(place_idx, place_idx + actual_delta)
-
-        noise[tuple(target_slice)] = noise[tuple(source_slice)]
-
+        if end_idx + delta >= latent_video_length:
+            final_delta = latent_video_length - place_idx
+            list_idx = torch.tensor(list(range(start_idx,start_idx+final_delta)), device=torch.device("cpu"), dtype=torch.long)
+            list_idx = list_idx[torch.randperm(final_delta, generator=generator)]
+            noise[:, :, place_idx:place_idx + final_delta] = noise[:, :, list_idx]
+            break
+        list_idx = torch.tensor(list(range(start_idx,start_idx+delta)), device=torch.device("cpu"), dtype=torch.long)
+        list_idx = list_idx[torch.randperm(delta, generator=generator)]
+        noise[:, :, place_idx:place_idx + delta] = noise[:, :, list_idx]
     return noise
