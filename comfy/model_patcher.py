@@ -1400,7 +1400,7 @@ class ModelPatcher:
                 continue
             key = "diffusion_model." + k
             unet_state_dict[k] = LazyCastingParam(self, key, comfy.utils.get_attr(self.model, key))
-        return self.model.state_dict_for_saving(unet_state_dict)
+        return self.model.state_dict_for_saving(unet_state_dict, clip_state_dict=clip_state_dict, vae_state_dict=vae_state_dict, clip_vision_state_dict=clip_vision_state_dict)
 
     def __del__(self):
         self.unpin_all_weights()
@@ -1597,7 +1597,7 @@ class ModelPatcherDynamic(ModelPatcher):
 
         if unpatch_weights:
             self.partially_unload_ram(1e32)
-            self.partially_unload(None)
+            self.partially_unload(None, 1e32)
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         assert not force_patch_weights #See above
