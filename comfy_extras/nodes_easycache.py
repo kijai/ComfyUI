@@ -108,7 +108,7 @@ def lazycache_predict_noise_wrapper(executor, *args, **kwargs):
     easycache: LazyCacheHolder = model_options["transformer_options"]["easycache"]
     if easycache.is_past_end_timestep(timestep):
         return executor(*args, **kwargs)
-    x, ax = _extract_tensor(args[0], easycache.output_channels)
+    x: torch.Tensor = _extract_tensor(args[0], easycache.output_channels)
     # prepare next x_prev
     next_x_prev = x
     input_change = None
@@ -126,17 +126,12 @@ def lazycache_predict_noise_wrapper(executor, *args, **kwargs):
                         logging.info(f"LazyCache [verbose] - skipping step; cumulative_change_rate: {easycache.cumulative_change_rate}, reuse_threshold: {easycache.reuse_threshold}")
                     # other conds should also skip this step, and instead use their cached values
                     easycache.skip_current_step = True
-                    result = easycache.apply_cache_diff(x)
-                    if ax is not None:
-                        result_audio = easycache.apply_cache_diff(ax, is_audio=True)
-                        return [result, result_audio]
-                    return result
+                    return easycache.apply_cache_diff(x)
                 else:
                     if easycache.verbose:
                         logging.info(f"LazyCache [verbose] - NOT skipping step; cumulative_change_rate: {easycache.cumulative_change_rate}, reuse_threshold: {easycache.reuse_threshold}")
                     easycache.cumulative_change_rate = 0.0
-    full_output: torch.Tensor = executor(*args, **kwargs)
-    output, aoutput = _extract_tensor(full_output, easycache.output_channels)
+    output: torch.Tensor = executor(*args, **kwargs)
     if easycache.has_output_prev_norm():
         output_change = (easycache.subsample(output, clone=False) - easycache.output_prev_subsampled).flatten().abs().mean()
         if easycache.verbose:
@@ -153,14 +148,12 @@ def lazycache_predict_noise_wrapper(executor, *args, **kwargs):
             logging.info(f"LazyCache [verbose] - output_change_rate: {output_change_rate}")
     # TODO: allow cache_diff to be offloaded
     easycache.update_cache_diff(output, next_x_prev)
-    if aoutput is not None:
-        easycache.update_cache_diff(aoutput, ax, is_audio=True)
     easycache.x_prev_subsampled = easycache.subsample(next_x_prev)
     easycache.output_prev_subsampled = easycache.subsample(output)
     easycache.output_prev_norm = output.flatten().abs().mean()
     if easycache.verbose:
         logging.info(f"LazyCache [verbose] - x_prev_subsampled: {easycache.x_prev_subsampled.shape}")
-    return full_output
+    return output
 
 def easycache_calc_cond_batch_wrapper(executor, *args, **kwargs):
     model_options = args[-1]
@@ -415,7 +408,6 @@ class LazyCacheHolder:
         self.output_prev_subsampled: torch.Tensor = None
         self.output_prev_norm: torch.Tensor = None
         self.cache_diff: torch.Tensor = None
-        self.cache_diff_audio: torch.Tensor = None
         self.output_change_rates = []
         self.approx_output_change_rates = []
         self.total_steps_skipped = 0
@@ -458,17 +450,12 @@ class LazyCacheHolder:
             return x.clone()
         return x
 
-    def apply_cache_diff(self, x: torch.Tensor, is_audio: bool = False):
-        if not is_audio:
-            self.total_steps_skipped += 1
-        cache_diff = self.cache_diff_audio if is_audio else self.cache_diff
-        return x + cache_diff.to(x.device)
+    def apply_cache_diff(self, x: torch.Tensor):
+        self.total_steps_skipped += 1
+        return x + self.cache_diff.to(x.device)
 
-    def update_cache_diff(self, output: torch.Tensor, x: torch.Tensor, is_audio: bool = False):
-        if is_audio:
-            self.cache_diff_audio = output - x
-        else:
-            self.cache_diff = output - x
+    def update_cache_diff(self, output: torch.Tensor, x: torch.Tensor):
+        self.cache_diff = output - x
 
     def check_metadata(self, x: torch.Tensor) -> bool:
         metadata = (x.device, x.dtype, x.shape)
@@ -489,8 +476,6 @@ class LazyCacheHolder:
         self.approx_output_change_rates = []
         del self.cache_diff
         self.cache_diff = None
-        del self.cache_diff_audio
-        self.cache_diff_audio = None
         del self.x_prev_subsampled
         self.x_prev_subsampled = None
         del self.output_prev_subsampled
