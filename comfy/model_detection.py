@@ -490,6 +490,80 @@ def detect_unet_config(state_dict, key_prefix, metadata=None):
 
         return dit_config
 
+    if '{}adapter.video_embedder.weight'.format(key_prefix) in state_dict_keys:  # MagiHuman
+        dit_config = {}
+        dit_config["image_model"] = "magi"
+        dit_config["hidden_size"] = state_dict['{}adapter.video_embedder.weight'.format(key_prefix)].shape[0]
+        dit_config["video_in_channels"] = state_dict['{}adapter.video_embedder.weight'.format(key_prefix)].shape[1]
+        dit_config["audio_in_channels"] = state_dict['{}adapter.audio_embedder.weight'.format(key_prefix)].shape[1]
+        dit_config["text_in_channels"] = state_dict['{}adapter.text_embedder.weight'.format(key_prefix)].shape[1]
+        dit_config["num_layers"] = count_blocks(state_dict_keys, '{}block.layers.'.format(key_prefix) + '{}.')
+        dit_config["head_dim"] = 128
+
+        # Detect num_query_groups from a single-expert layer's qkv weight
+        # mm_layers are [0,1,2,3,36,37,38,39], so layer 4 is always single-expert
+        hidden_size = dit_config["hidden_size"]
+        single_layer_idx = min(4, dit_config["num_layers"] - 1)
+        qkv_key = '{}block.layers.{}.attention.linear_qkv.weight'.format(key_prefix, single_layer_idx)
+        if qkv_key in state_dict_keys:
+            qkv_out = state_dict[qkv_key].shape[0]
+            # qkv_out = num_heads_q * head_dim + 2 * num_heads_kv * head_dim + num_heads_q (gating)
+            num_heads_q = hidden_size // dit_config["head_dim"]
+            # qkv_out = num_heads_q * head_dim + 2 * num_heads_kv * head_dim + num_heads_q
+            # qkv_out - num_heads_q * (head_dim + 1) = 2 * num_heads_kv * head_dim
+            num_heads_kv = (qkv_out - num_heads_q * (dit_config["head_dim"] + 1)) // (2 * dit_config["head_dim"])
+            dit_config["num_query_groups"] = num_heads_kv
+        else:
+            dit_config["num_query_groups"] = 8
+
+        # Detect mm_layers from weight sizes (3x for multi-expert vs 1x for single-expert)
+        mm_layers = []
+        for i in range(dit_config["num_layers"]):
+            norm_key = '{}block.layers.{}.attention.pre_norm.weight'.format(key_prefix, i)
+            if norm_key in state_dict_keys:
+                norm_size = state_dict[norm_key].shape[0]
+                if norm_size == hidden_size * 3:
+                    mm_layers.append(i)
+        if mm_layers:
+            dit_config["mm_layers"] = mm_layers
+
+        # Detect gelu7_layers from MLP intermediate size
+        gelu7_layers = []
+        for i in range(dit_config["num_layers"]):
+            up_key = '{}block.layers.{}.mlp.up_gate_proj.weight'.format(key_prefix, i)
+            if up_key in state_dict_keys:
+                up_size = state_dict[up_key].shape[0]
+                num_exp = 3 if i in mm_layers else 1
+                effective_up = up_size // num_exp
+                # gelu7: intermediate = hidden_size * 4 (non-gated)
+                # swiglu7: intermediate * 2 = int(hidden_size * 4 * 2/3) // 4 * 4 * 2
+                if effective_up == hidden_size * 4:
+                    gelu7_layers.append(i)
+        if gelu7_layers:
+            dit_config["gelu7_layers"] = gelu7_layers
+
+        # Detect enable_attn_gating
+        qkv_key_0 = '{}block.layers.0.attention.linear_qkv.weight'.format(key_prefix)
+        if qkv_key_0 in state_dict_keys:
+            qkv_out_0 = state_dict[qkv_key_0].shape[0]
+            num_exp_0 = 3 if 0 in mm_layers else 1
+            effective_qkv = qkv_out_0 // num_exp_0
+            num_heads_q = hidden_size // dit_config["head_dim"]
+            num_heads_kv = dit_config["num_query_groups"]
+            expected_no_gate = num_heads_q * dit_config["head_dim"] + 2 * num_heads_kv * dit_config["head_dim"]
+            dit_config["enable_attn_gating"] = effective_qkv > expected_no_gate
+
+        # Detect post_norm_layers
+        post_norm_layers = []
+        for i in range(dit_config["num_layers"]):
+            pn_key = '{}block.layers.{}.attn_post_norm.weight'.format(key_prefix, i)
+            if pn_key in state_dict_keys:
+                post_norm_layers.append(i)
+        if post_norm_layers:
+            dit_config["post_norm_layers"] = post_norm_layers
+
+        return dit_config
+
     if '{}head.modulation'.format(key_prefix) in state_dict_keys:  # Wan 2.1
         dit_config = {}
         dit_config["image_model"] = "wan2.1"

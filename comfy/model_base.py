@@ -18,6 +18,7 @@
 
 import comfy.ldm.hunyuan3dv2_1
 import comfy.ldm.hunyuan3dv2_1.hunyuandit
+import comfy.ldm.magi.model
 import torch
 import logging
 import comfy.ldm.lightricks.av_model
@@ -333,10 +334,10 @@ class BaseModel(torch.nn.Module):
         del to_load
         return self
 
-    def process_latent_in(self, latent):
+    def process_latent_in(self, latent, **kwargs):
         return self.latent_format.process_in(latent)
 
-    def process_latent_out(self, latent):
+    def process_latent_out(self, latent, **kwargs):
         return self.latent_format.process_out(latent)
 
     def state_dict_for_saving(self, unet_state_dict, clip_state_dict=None, vae_state_dict=None, clip_vision_state_dict=None):
@@ -1953,3 +1954,91 @@ class Kandinsky5Image(Kandinsky5):
 
     def concat_cond(self, **kwargs):
         return None
+
+class MagiHuman(BaseModel):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.magi.model.MagiModel)
+
+    def extra_conds(self, **kwargs):
+        out = super().extra_conds(**kwargs)
+        cross_attn = kwargs.get("cross_attn", None)
+        if cross_attn is not None:
+            out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
+
+        attention_mask = kwargs.get("attention_mask", None)
+        if attention_mask is not None:
+            out['attention_mask'] = comfy.conds.CONDRegular(attention_mask)
+
+        latent_shapes = kwargs.get("latent_shapes", None)
+        if latent_shapes is not None:
+            out['latent_shapes'] = comfy.conds.CONDConstant(latent_shapes)
+
+        return out
+
+    def _find_video_component(self, latent_shapes):
+        """Find the video component index in packed latent_shapes by matching channel count."""
+        target_channels = self.latent_format.latent_channels  # 48 for Wan22
+        for i, shape in enumerate(latent_shapes):
+            if len(shape) == 5 and shape[1] == target_channels:
+                return i
+        return None
+
+    def _packed_process(self, latent, latent_shapes, fn):
+        """Apply fn (process_in or process_out) to only the video component of a packed tensor."""
+        video_idx = self._find_video_component(latent_shapes)
+        if video_idx is None:
+            return fn(latent)
+        # Compute offset to video component
+        offset = 0
+        for i in range(video_idx):
+            flat = 1
+            for s in latent_shapes[i][1:]:
+                flat *= s
+            offset += flat
+        video_flat = 1
+        for s in latent_shapes[video_idx][1:]:
+            video_flat *= s
+        result = latent.clone()
+        video = result[:, :, offset:offset + video_flat].reshape(latent_shapes[video_idx])
+        video = fn(video)
+        result[:, :, offset:offset + video_flat] = video.reshape(result.shape[0], 1, -1)
+        return result
+
+    def process_latent_in(self, latent, **kwargs):
+        latent_shapes = kwargs.get("latent_shapes", None)
+        if latent.ndim == 3 and latent_shapes is not None:
+            return self._packed_process(latent, latent_shapes, self.latent_format.process_in)
+        if latent.ndim == 3:
+            # Packed tensor without shapes — can't safely normalize, return as-is
+            return latent
+        return self.latent_format.process_in(latent)
+
+    def process_latent_out(self, latent, **kwargs):
+        latent_shapes = kwargs.get("latent_shapes", None)
+        if latent.ndim == 3 and latent_shapes is not None:
+            return self._packed_process(latent, latent_shapes, self.latent_format.process_out)
+        if latent.ndim == 3:
+            # Packed tensor without shapes — can't safely denormalize, return as-is
+            return latent
+        return self.latent_format.process_out(latent)
+
+    def scale_latent_inpaint(self, sigma, noise, latent_image, **kwargs):
+        # MagiHuman I2V: first frame is hard-replaced every step (no noise mixing)
+        return latent_image
+
+    def memory_required(self, input_shape, cond_shapes={}):
+        dtype = self.get_dtype_inference()
+        dtype_size = comfy.model_management.dtype_size(dtype)
+        batch = input_shape[0]
+        if len(input_shape) == 5:
+            # Standard video latent (B, C, T, H, W)
+            T, H, W = input_shape[2], input_shape[3], input_shape[4]
+            seq_len = T * (H // 2) * (W // 2)
+        else:
+            # Packed NestedTensor (B, 1, flat) — estimate from flat size
+            flat = input_shape[-1]
+            seq_len = flat // 192  # approximate: 192 = 48 channels * patch 1*2*2
+        hidden_size = self.diffusion_model.hidden_size
+        num_layers = self.diffusion_model.num_layers
+        per_layer = batch * seq_len * hidden_size * 12 * dtype_size
+        return per_layer * max(num_layers // 8, 1)

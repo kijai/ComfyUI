@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//s/comfy/comfy-kitchen/comfy_kitchen/backends/cuda/**)",
+      "Read(//s/comfy/comfy-kitchen/**)",
+      "Bash(N:/AI/ComfyUI/venv/Scripts/python.exe setup.py build_ext --inplace --cuda-archs=\"89\")",
+      "Bash(N:/AI/ComfyUI/venv/Scripts/python.exe -c \":*)"
+    ],
+    "additionalDirectories": [
+      "S:\\comfy\\comfy-kitchen\\comfy_kitchen\\backends\\cuda",
+      "N:\\AI\\ComfyUI\\venv\\Lib\\site-packages\\comfy_kitchen\\backends\\cuda"
+    ]
+  }
+}

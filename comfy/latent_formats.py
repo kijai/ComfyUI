@@ -595,6 +595,10 @@ class Wan22(Wan21):
                 0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744
             ]).view(1, self.latent_channels, 1, 1, 1)
 
+class MagiHuman(Wan22):
+    """Wan22 latent format for MagiHuman. Inherits mean/std normalization."""
+    pass
+
 class HunyuanImage21(LatentFormat):
     latent_channels = 64
     latent_dimensions = 2

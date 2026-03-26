@@ -61,6 +61,7 @@ import comfy.text_encoders.newbie
 import comfy.text_encoders.anima
 import comfy.text_encoders.ace15
 import comfy.text_encoders.longcat_image
+import comfy.text_encoders.t5gemma
 
 import comfy.model_patcher
 import comfy.lora
@@ -1186,6 +1187,7 @@ class CLIPType(Enum):
     NEWBIE = 24
     FLUX2 = 25
     LONGCAT_IMAGE = 26
+    MAGI = 27
 
 
 
@@ -1228,6 +1230,7 @@ class TEModel(Enum):
     QWEN3_8B = 20
     QWEN3_06B = 21
     GEMMA_3_4B_VISION = 22
+    T5GEMMA_9B = 23
 
 
 def detect_te_model(sd):
@@ -1260,6 +1263,9 @@ def detect_te_model(sd):
                 return TEModel.GEMMA_3_4B_VISION
             else:
                 return TEModel.GEMMA_3_4B
+        weight = sd['model.layers.0.post_feedforward_layernorm.weight']
+        if weight.shape[0] == 3584:
+            return TEModel.T5GEMMA_9B
         return TEModel.GEMMA_2_2B
     if 'model.layers.0.self_attn.k_proj.bias' in sd:
         weight = sd['model.layers.0.self_attn.k_proj.bias']
@@ -1305,6 +1311,19 @@ def llama_detect(clip_data):
         if weight_name in sd:
             return comfy.text_encoders.hunyuan_video.llama_detect(sd)
 
+    return {}
+
+def t5gemma_detect(clip_data):
+    for sd in clip_data:
+        if "model.layers.0.self_attn.k_proj.weight" in sd:
+            out = {}
+            norm_key = "model.norm.weight"
+            if norm_key in sd:
+                out["dtype_t5gemma"] = sd[norm_key].dtype
+            quant = comfy.utils.detect_layer_quantization(sd, "model.")
+            if quant is not None:
+                out["t5gemma_quantization_metadata"] = quant
+            return out
     return {}
 
 def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}, disable_dynamic=False):
@@ -1357,6 +1376,10 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
                 clip_target.clip = comfy.text_encoders.wan.te(**t5xxl_detect(clip_data))
                 clip_target.tokenizer = comfy.text_encoders.wan.WanT5Tokenizer
                 tokenizer_data["spiece_model"] = clip_data[0].get("spiece_model", None)
+            elif clip_type == CLIPType.MAGI:
+                clip_target.clip = comfy.text_encoders.t5gemma.te(**t5gemma_detect(clip_data))
+                clip_target.tokenizer = comfy.text_encoders.t5gemma.T5GemmaTokenizer
+                tokenizer_data["spiece_model"] = clip_data[0].get("spiece_model", None)
             elif clip_type == CLIPType.HIDREAM:
                 clip_target.clip = comfy.text_encoders.hidream.hidream_clip(**t5xxl_detect(clip_data),
                                                                         clip_l=False, clip_g=False, t5=True, llama=False, dtype_llama=None)
@@ -1389,6 +1412,10 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
         elif te_model == TEModel.GEMMA_3_4B_VISION:
             clip_target.clip = comfy.text_encoders.lumina2.te(**llama_detect(clip_data), model_type="gemma3_4b_vision")
             clip_target.tokenizer = comfy.text_encoders.lumina2.NTokenizer
+            tokenizer_data["spiece_model"] = clip_data[0].get("spiece_model", None)
+        elif te_model == TEModel.T5GEMMA_9B:
+            clip_target.clip = comfy.text_encoders.t5gemma.te(**t5gemma_detect(clip_data))
+            clip_target.tokenizer = comfy.text_encoders.t5gemma.T5GemmaTokenizer
             tokenizer_data["spiece_model"] = clip_data[0].get("spiece_model", None)
         elif te_model == TEModel.GEMMA_3_12B:
             clip_target.clip = comfy.text_encoders.lt.gemma3_te(**llama_detect(clip_data))

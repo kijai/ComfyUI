@@ -357,6 +357,31 @@ class Gemma3_12B_Config:
     mm_tokens_per_image = 256
     stop_tokens = [1, 106]
 
+@dataclass
+class T5Gemma_9B_Config:
+    vocab_size: int = 256000
+    hidden_size: int = 3584
+    intermediate_size: int = 14336
+    num_hidden_layers: int = 42
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 8
+    max_position_embeddings: int = 8192
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+    transformer_type: str = "gemma2"
+    head_dim: int = 256
+    rms_norm_add: bool = True
+    mlp_activation: str = "gelu_pytorch_tanh"
+    qkv_bias: bool = False
+    rope_dims = None
+    q_norm = None
+    k_norm = None
+    sliding_attention = [4096, False]
+    rope_scale = None
+    final_norm: bool = True
+    lm_head: bool = False
+    causal: bool = False
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5, add=False, device=None, dtype=None):
         super().__init__()
@@ -598,6 +623,15 @@ class TransformerBlockGemma2(nn.Module):
                 freqs_cis = freqs_cis[1]
             else:
                 freqs_cis = freqs_cis[0]
+        elif self.sliding_attention:
+            sliding_window = self.sliding_attention
+            if x.shape[1] > self.sliding_attention:
+                sliding_mask = torch.full((x.shape[1], x.shape[1]), torch.finfo(x.dtype).min, device=x.device, dtype=x.dtype)
+                sliding_mask.tril_(diagonal=-self.sliding_attention)
+                if attention_mask is not None:
+                    attention_mask = attention_mask + sliding_mask
+                else:
+                    attention_mask = sliding_mask
 
         # Self Attention
         residual = x
@@ -684,7 +718,7 @@ class Llama2_(nn.Module):
             mask = 1.0 - attention_mask.to(x.dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])).expand(attention_mask.shape[0], 1, seq_len, attention_mask.shape[-1])
             mask = mask.masked_fill(mask.to(torch.bool), torch.finfo(x.dtype).min / 4)
 
-        if seq_len > 1:
+        if getattr(self.config, 'causal', True) and seq_len > 1:
             causal_mask = torch.empty(past_len + seq_len, past_len + seq_len, dtype=x.dtype, device=x.device).fill_(torch.finfo(x.dtype).min / 4).triu_(1)
             if mask is not None:
                 mask += causal_mask
@@ -1059,6 +1093,14 @@ class Gemma2_2B(BaseLlama, BaseGenerate, torch.nn.Module):
         config = Gemma2_2B_Config(**config_dict)
         self.num_layers = config.num_hidden_layers
 
+        self.model = Llama2_(config, device=device, dtype=dtype, ops=operations)
+        self.dtype = dtype
+
+class T5Gemma_9B(BaseLlama, torch.nn.Module):
+    def __init__(self, config_dict, dtype, device, operations):
+        super().__init__()
+        config = T5Gemma_9B_Config(**config_dict)
+        self.num_layers = config.num_hidden_layers
         self.model = Llama2_(config, device=device, dtype=dtype, ops=operations)
         self.dtype = dtype
 
