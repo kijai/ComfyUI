@@ -4,13 +4,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import repeat
 
 from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.flux.math import rope as flux_rope
 import comfy.ldm.common_dit
 import comfy.model_management
 import comfy.patcher_extension
-import comfy.utils
 import comfy.ops
 
 
@@ -33,27 +32,39 @@ def gelu7(x, alpha=1.702, limit=7.0):
     return (x * torch.sigmoid(alpha * x)).to(out_dtype)
 
 
-# ──────────────────────── RoPE helpers ────────────────────────
+def apply_rope_halfsplit(x, freqs_cis):
+    """Apply rotary embeddings using half-split pairing (MagiHuman style).
 
-def freq_bands(num_bands, temperature=10000.0, step=1, device=None):
-    exp = torch.arange(0, num_bands, step, dtype=torch.int64, device=device).float() / num_bands
-    return 1.0 / (temperature ** exp)
+    Unlike Flux's consecutive pairing (x0,x1), (x2,x3), this pairs
+    first half with second half: (x0,x_N/2), (x1,x_N/2+1), etc.
 
+    freqs_cis: (1, L, 1, num_pairs, 2, 2) rotation matrices from flux_rope
+    x: (1, L, heads, head_dim)
+    """
+    ro_dim = freqs_cis.shape[-3] * 2
+    ro_half = ro_dim // 2
 
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+    # Split into halves (not consecutive pairs)
+    x_rot = x[..., :ro_dim]
+    x_pass = x[..., ro_dim:]
+    x_a = x_rot[..., :ro_half]  # first half
+    x_b = x_rot[..., ro_half:]  # second half
 
+    # Extract cos/sin from rotation matrices
+    # freqs_cis[..., 0, 0] = cos, freqs_cis[..., 0, 1] = -sin
+    cos = freqs_cis[..., 0, 0]  # (1, L, 1, num_pairs)
+    sin = freqs_cis[..., 1, 0]  # (1, L, 1, num_pairs) = sin
 
-def apply_rotary_emb_torch(x, cos, sin):
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    cos = repeat(cos, "... d -> ... 1 (2 d)")
-    sin = repeat(sin, "... d -> ... 1 (2 d)")
-    return torch.cat([
-        x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim]) * sin,
-        x[..., ro_dim:]
-    ], dim=-1)
+    # Apply rotation with half-split pairing:
+    # out_a = a * cos - b * sin
+    # out_b = b * cos + a * sin
+    dtype = x.dtype
+    x_a, x_b = x_a.float(), x_b.float()
+    cos, sin = cos.float(), sin.float()
+    out_a = x_a * cos - x_b * sin
+    out_b = x_b * cos + x_a * sin
+
+    return torch.cat([out_a, out_b, x_pass.float()], dim=-1).to(dtype)
 
 
 # ──────────────────────── Coordinate generation ────────────────────────
@@ -113,11 +124,10 @@ class ElementWiseFourierEmbed(nn.Module):
         super().__init__()
         self.dim = dim
         self.temperature = temperature
-        bands = freq_bands(dim // 8, temperature=temperature, step=1, device=device).to(dtype)
-        self.register_buffer("bands", bands)
+        self.dims_per_axis = (dim // 8) * 2  # 32 rotary dims per axis
 
     def forward(self, coords):
-        coords_xyz = coords[:, :3]
+        coords_xyz = coords[:, :3]   # (L, 3)
         sizes = coords[:, 3:6]
         refs = coords[:, 6:9]
 
@@ -126,54 +136,43 @@ class ElementWiseFourierEmbed(nn.Module):
 
         centers = (sizes - 1) / 2
         centers[:, 0] = 0
-        coords_xyz = coords_xyz - centers
+        scaled_pos = (coords_xyz - centers) * scales  # (L, 3)
 
-        proj = coords_xyz.unsqueeze(-1) * scales.unsqueeze(-1) * self.bands
-        sin_proj = proj.sin()
-        cos_proj = proj.cos()
-        return torch.cat((sin_proj, cos_proj), dim=1).flatten(1)
+        # Generate rope per axis using Flux format, concat like EmbedND
+        rope_axes = []
+        for axis in range(3):
+            pos = scaled_pos[:, axis].unsqueeze(0)  # (1, L)
+            rope_axes.append(flux_rope(pos, self.dims_per_axis, self.temperature))
+        rope = torch.cat(rope_axes, dim=-3)  # (1, L, 48, 2, 2)
+
+        return rope.unsqueeze(2)  # (1, L, 1, 48, 2, 2)
 
 
 # ──────────────────────── MultiModality RMSNorm ────────────────────────
 
 class MultiModalityRMSNorm(nn.Module):
-    """RMSNorm with per-modality weights. For multi-expert layers, weight has
-    shape (dim * num_modality,) and is chunked per modality during forward.
-    Uses separate ops.Linear-style sub-norms when split by process_unet_state_dict."""
-
     def __init__(self, dim, eps=1e-6, num_modality=1, device=None, dtype=None):
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.num_modality = num_modality
-        # Single weight parameter matching checkpoint layout
-        self.weight = nn.Parameter(torch.zeros(dim * num_modality, device=device, dtype=torch.float32))
-
-    def _rms(self, x):
-        t = x.float()
-        return t * torch.rsqrt(t.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        self.weight = nn.Parameter(torch.zeros(dim * num_modality, device=device, dtype=dtype))
 
     def forward(self, x, modality_dispatcher=None):
-        # Keep weight in fp32 for precision — the original model uses fp32 norms
-        weight = comfy.model_management.cast_to(self.weight, dtype=torch.float32, device=x.device)
-        t = self._rms(x)  # always fp32
+        weight = comfy.model_management.cast_to(self.weight, dtype=x.dtype, device=x.device)
         if self.num_modality > 1 and modality_dispatcher is not None:
-            weight_chunked = weight.chunk(self.num_modality, dim=0)
-            t_list = modality_dispatcher.dispatch(t)
+            normed = comfy.ldm.common_dit.rms_norm(x, eps=self.eps)
+            weight_chunked = (weight + 1).chunk(self.num_modality, dim=0)
+            t_list = modality_dispatcher.dispatch(normed)
             for i in range(self.num_modality):
-                t_list[i] = t_list[i] * (weight_chunked[i] + 1)
+                t_list[i] = t_list[i] * weight_chunked[i]
             return modality_dispatcher.undispatch(*t_list)
-        return t * (weight + 1)
+        return comfy.ldm.common_dit.rms_norm(x, weight + 1, self.eps)
 
 
 # ──────────────────────── MoE-aware Linear ────────────────────────
 
 class MagiMoELinear(nn.Module):
-    """Linear with multi-expert support using proper comfy ops.
-    Single expert: uses operations.Linear directly.
-    Multi expert: uses nn.ModuleList of operations.Linear, one per expert.
-    State dict remapping handled by process_unet_state_dict in supported_models.
-    """
     def __init__(self, in_features, out_features, num_experts=1, bias=False, operation_settings={}):
         super().__init__()
         self.num_experts = num_experts
@@ -228,8 +227,8 @@ class MagiAttention(nn.Module):
         self.k_norm = MultiModalityRMSNorm(head_dim, num_modality=num_modality)
 
     def forward(self, hidden_states, rope, modality_dispatcher, transformer_options={}):
-        normed = self.pre_norm(hidden_states, modality_dispatcher=modality_dispatcher).to(torch.bfloat16)
-        qkv = self.linear_qkv(normed, modality_dispatcher=modality_dispatcher).to(torch.float32)
+        normed = self.pre_norm(hidden_states, modality_dispatcher=modality_dispatcher)
+        qkv = self.linear_qkv(normed, modality_dispatcher=modality_dispatcher)
 
         q, k, v, g = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size, self.gating_size], dim=-1)
         q = q.view(-1, self.num_heads_q, self.head_dim)
@@ -245,18 +244,18 @@ class MagiAttention(nn.Module):
         k = ModalityDispatcher.inv_permute(k, modality_dispatcher.inv_permute_mapping).unsqueeze(0)
         v = ModalityDispatcher.inv_permute(v, modality_dispatcher.inv_permute_mapping).unsqueeze(0)
 
-        sin_emb, cos_emb = rope.tensor_split(2, -1)
-        q = apply_rotary_emb_torch(q, cos_emb, sin_emb)
-        k = apply_rotary_emb_torch(k, cos_emb, sin_emb)
+        q = apply_rope_halfsplit(q, rope)
+        k = apply_rope_halfsplit(k, rope)
 
-        # Cast to bf16 and use native GQA - matching original's flash attention
-        # which takes q(40 heads) and k,v(8 heads) without repeating.
-        q = q.to(torch.bfloat16).transpose(1, 2)  # (1, heads_q, L, dim)
-        k = k.to(torch.bfloat16).transpose(1, 2)  # (1, heads_kv, L, dim)
-        v = v.to(torch.bfloat16).transpose(1, 2)  # (1, heads_kv, L, dim)
+        q = q.transpose(1, 2)  # (1, heads_q, L, dim)
+        k = k.transpose(1, 2)  # (1, heads_kv, L, dim)
+        v = v.transpose(1, 2)  # (1, heads_kv, L, dim)
 
-        out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
-        out = out.transpose(1, 2).squeeze(0)  # (L, heads_q, dim)
+        if self.num_heads_kv < self.num_heads_q:
+            k = k.repeat_interleave(self.num_heads_q // self.num_heads_kv, dim=1)
+            v = v.repeat_interleave(self.num_heads_q // self.num_heads_kv, dim=1)
+
+        out = optimized_attention(q, k, v, self.num_heads_q, skip_reshape=True)
         out = out.squeeze(0)
 
         out = ModalityDispatcher.permute(out, modality_dispatcher.permute_mapping)
@@ -267,9 +266,8 @@ class MagiAttention(nn.Module):
             out = out.view(-1, self.num_heads_q, self.head_dim)
             out = out * torch.sigmoid(g).unsqueeze(-1)
 
-        out = out.reshape(-1, self.num_heads_q * self.head_dim).to(torch.bfloat16)
-        out = self.linear_proj(out, modality_dispatcher=modality_dispatcher)
-        return out.float()
+        out = out.reshape(-1, self.num_heads_q * self.head_dim)
+        return self.linear_proj(out, modality_dispatcher=modality_dispatcher)
 
 
 # ──────────────────────── MLP ────────────────────────
@@ -281,17 +279,15 @@ class MagiMLP(nn.Module):
         self.pre_norm = MultiModalityRMSNorm(hidden_size, num_modality=num_modality)
 
         up_size = intermediate_size * 2 if gated_act else intermediate_size
-        self.up_gate_proj = MagiMoELinear(hidden_size, up_size, num_experts=num_modality,
-                                          bias=False, operation_settings=operation_settings)
-        self.down_proj = MagiMoELinear(intermediate_size, hidden_size, num_experts=num_modality,
-                                       bias=False, operation_settings=operation_settings)
+        self.up_gate_proj = MagiMoELinear(hidden_size, up_size, num_experts=num_modality, bias=False, operation_settings=operation_settings)
+        self.down_proj = MagiMoELinear(intermediate_size, hidden_size, num_experts=num_modality, bias=False, operation_settings=operation_settings)
         self.activation = swiglu7 if activation_type == "swiglu7" else gelu7
 
     def forward(self, x, modality_dispatcher):
-        normed = self.pre_norm(x, modality_dispatcher=modality_dispatcher).to(torch.bfloat16)
-        up = self.up_gate_proj(normed, modality_dispatcher=modality_dispatcher).to(torch.float32)
-        activated = self.activation(up).to(torch.bfloat16)
-        return self.down_proj(activated, modality_dispatcher=modality_dispatcher).to(torch.float32)
+        normed = self.pre_norm(x, modality_dispatcher=modality_dispatcher)
+        up = self.up_gate_proj(normed, modality_dispatcher=modality_dispatcher)
+        activated = self.activation(up)
+        return self.down_proj(activated, modality_dispatcher=modality_dispatcher)
 
 
 # ──────────────────────── Transformer Layer ────────────────────────
@@ -330,17 +326,15 @@ class MagiTransformerLayer(nn.Module):
             self.mlp_post_norm = MultiModalityRMSNorm(hidden_size, num_modality=num_modality)
 
     def forward(self, x, rope, modality_dispatcher, transformer_options={}):
-        # Accumulate residuals in fp32 to match original's precision
-        x = x.float()
         attn_out = self.attention(x, rope, modality_dispatcher, transformer_options)
         if self.has_post_norm:
             attn_out = self.attn_post_norm(attn_out, modality_dispatcher=modality_dispatcher)
-        x = x + attn_out.float()
+        x = x + attn_out
 
         mlp_out = self.mlp(x, modality_dispatcher)
         if self.has_post_norm:
             mlp_out = self.mlp_post_norm(mlp_out, modality_dispatcher=modality_dispatcher)
-        x = x + mlp_out.float()
+        x = x + mlp_out
         return x
 
 
@@ -406,8 +400,6 @@ class MagiModel(nn.Module):
             post_norm_layers = []
         if patch_size is None:
             patch_size = (1, 2, 2)
-        if operations is None:
-            operations = comfy.ops.disable_weight_init
 
         self.mm_layers = mm_layers
         self.gelu7_layers = gelu7_layers
@@ -443,24 +435,21 @@ class MagiModel(nn.Module):
         self.final_linear_audio = operations.Linear(hidden_size, audio_in_channels, bias=False, device=device, dtype=dtype)
 
 
-
     def _patchify(self, x):
-        """Match UnfoldNd ordering: per-token values are (C, pT, pH, pW) - channel outermost."""
         pt, ph, pw = self.patch_size
         B, C, T, H, W = x.shape
         x = x.reshape(B, C, T // pt, pt, H // ph, ph, W // pw, pw)
-        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)  # (B, T', H', W', C, pt, ph, pw)
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)
         x = x.reshape(B, -1, C * pt * ph * pw)
         return x
 
     def _unpatchify(self, x, T, H, W):
-        """Depack: C-innermost ordering (pT, pH, pW, C) per token, matching original depack rearrange."""
         pt, ph, pw = self.patch_size
         C = self.video_in_channels // (pt * ph * pw)
         T_p, H_p, W_p = T // pt, H // ph, W // pw
         B = x.shape[0]
         x = x.reshape(B, T_p, H_p, W_p, pt, ph, pw, C)
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6)  # (B, C, T', pt, H', ph, W', pw)
+        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6)
         x = x.reshape(B, C, T, H, W)
         return x
 
@@ -493,8 +482,9 @@ class MagiModel(nn.Module):
             shape=(t_p, h_p, w_p), ref_feat_shape=(t_p, h_p, w_p),
             device=device, dtype=dtype,
         )
+        magic_audio_ref_t = (n_audio - 1) // 4 + 1
         audio_coords = get_coords(
-            shape=(n_audio, 1, 1), ref_feat_shape=(t_p, 1, 1),
+            shape=(n_audio, 1, 1), ref_feat_shape=(magic_audio_ref_t // pt, 1, 1),
             device=device, dtype=dtype,
         )
         text_coords = get_coords(
@@ -512,7 +502,6 @@ class MagiModel(nn.Module):
         ).execute(x, timestep, context, transformer_options, **kwargs)
 
     def _forward(self, x, timestep, context, transformer_options={}, **kwargs):
-        # Handle list input from _apply_model's unpack_latents
         if isinstance(x, list):
             video_latent = None
             audio_latent = None
@@ -522,7 +511,7 @@ class MagiModel(nn.Module):
                 elif component.ndim == 3 and component.shape[2] == self.audio_in_channels:
                     audio_latent = component
             if video_latent is None:
-                video_latent = x[0]  # fallback
+                video_latent = x[0]
             has_audio = audio_latent is not None
         else:
             video_latent = x
@@ -533,7 +522,6 @@ class MagiModel(nn.Module):
         device = video_latent.device
         dtype = video_latent.dtype
 
-        # Get attention mask to determine real text token count
         attention_mask = kwargs.get("attention_mask", None)
 
         video_tokens_batch = self._patchify(video_latent)
@@ -544,8 +532,6 @@ class MagiModel(nn.Module):
         for b in range(B):
             video_tokens = video_tokens_batch[b]
 
-            # Audio tokens: use consistent random noise matching original pipeline.
-            # Cached so the same noise is used across all sampling steps.
             if has_audio and audio_latent is not None:
                 audio_tok = audio_latent[b]
                 if audio_tok.dim() == 1:
@@ -562,7 +548,6 @@ class MagiModel(nn.Module):
                     }
                 audio_tok = self._audio_cache['data'].to(device=device, dtype=dtype)
 
-            # Text tokens: truncate to real length using attention mask (discard padding)
             if context is not None:
                 text_tok = context[b]
                 if attention_mask is not None:
@@ -577,16 +562,6 @@ class MagiModel(nn.Module):
 
             n_audio = audio_tok.shape[0]
             n_text = text_tok.shape[0]
-
-            if not hasattr(self, '_call_count'):
-                self._call_count = 0
-            self._call_count += 1
-            if self._call_count <= 2:
-                import logging
-                logging.info("MagiModel call %d: x_mean=%.4f x_std=%.4f, video_tok=%s, audio=%s, text=%s",
-                             self._call_count,
-                             video_latent[b].float().mean().item(), video_latent[b].float().std().item(),
-                             list(video_tokens.shape), list(audio_tok.shape), list(text_tok.shape))
 
             token_seq, modality_mapping = self._build_sequence(
                 video_tokens, audio_tok, text_tok, device, dtype

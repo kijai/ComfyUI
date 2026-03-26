@@ -16,8 +16,7 @@ class EmptyMagiAudioLatent(io.ComfyNode):
             category="latent/video/magi",
             description="Generate random audio latent noise for MagiHuman. Length should match the video frame count (e.g. seconds * 25 + 1).",
             inputs=[
-                io.Int.Input("length", default=251, min=1, max=nodes.MAX_RESOLUTION, step=1,
-                             tooltip="Number of audio frames (= video frames, typically seconds * 25 + 1)"),
+                io.Int.Input("length", default=251, min=1, max=nodes.MAX_RESOLUTION, step=1, tooltip="Number of audio frames (= video frames, typically seconds * 25 + 1)"),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
             ],
             outputs=[
@@ -103,22 +102,21 @@ class MagiSeparateAVLatent(io.ComfyNode):
 
 
 def _build_magi_sigmas(num_steps, shift_scale=5.0, num_timesteps=1000):
-    """Build MagiHuman's ZeroSNRDDPMDiscretization sigma schedule.
-    Returns ascending sigmas [~0, ..., ~0.75, 0.0] for step_ddim."""
-    betas = np.linspace(0.00085 ** 0.5, 0.0120 ** 0.5, num_timesteps) ** 2
-    alphas = 1.0 - betas
-    alphas_cumprod = np.cumprod(alphas)
-    alphas_cumprod = alphas_cumprod / (shift_scale + (1 - shift_scale) * alphas_cumprod)
-    acp_sqrt = np.sqrt(alphas_cumprod)
+    """Build MagiHuman's FlowUniPCMultistepScheduler sigma schedule.
+    Matches the original: shift applied twice (init + set_timesteps), descending from ~1.0 to 0."""
+    # Step 1: build full schedule with shift applied once (matches scheduler __init__)
+    alphas = np.linspace(1, 1.0 / num_timesteps, num_timesteps)[::-1].copy()
+    sigmas_full = 1.0 - alphas
+    sigmas_full = shift_scale * sigmas_full / (1 + (shift_scale - 1) * sigmas_full)
 
-    timesteps = np.linspace(num_timesteps - 1, 0, num_steps, endpoint=False).astype(int)[::-1]
-    selected = acp_sqrt[timesteps]
-    s0, sT = selected[0], selected[-1]
-    normalized = (selected - sT) * s0 / (s0 - sT)
+    sigma_max = sigmas_full[0]
+    sigma_min = sigmas_full[-1]
 
-    # Flip to ascending (clean→noisy), append final 0 (denoise to clean)
-    sigmas = np.flip(normalized).copy()
-    sigmas = np.append(sigmas, 0.0)
+    # Step 2: subsample and apply shift again (matches set_timesteps)
+    sigmas = np.linspace(sigma_max, sigma_min, num_steps + 1).copy()[:-1]
+    sigmas = shift_scale * sigmas / (1 + (shift_scale - 1) * sigmas)
+
+    sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
     return torch.from_numpy(sigmas).float()
 
 
