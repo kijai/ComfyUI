@@ -122,8 +122,18 @@ def prepare_callback(model, steps, x0_output_dict=None):
             x0_output_dict["x0"] = x0
 
         preview_bytes = None
-        if previewer:
-            preview_bytes = previewer.decode_latent_to_preview_image(preview_format, x0)
+        if previewer and x0 is not None:
+            preview_x0 = x0
+            if x0.ndim == 3:
+                latent_shapes = getattr(model, 'latent_shapes', None)
+                if latent_shapes is not None:
+                    components = comfy.utils.unpack_latents(x0, latent_shapes)
+                    dims = model.model.latent_format.latent_dimensions + 2
+                    preview_x0 = next((c for c, s in zip(components, latent_shapes) if len(s) == dims), None)
+                else:
+                    preview_x0 = None
+            if preview_x0 is not None:
+                preview_bytes = previewer.decode_latent_to_preview_image(preview_format, preview_x0)
         pbar.update_absolute(step + 1, total_steps, preview_bytes)
     return callback
 

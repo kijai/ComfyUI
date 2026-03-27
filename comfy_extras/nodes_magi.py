@@ -1,6 +1,5 @@
 import nodes
 import torch
-import numpy as np
 import comfy.nested_tensor
 import comfy.model_management
 from comfy_api.latest import io
@@ -65,7 +64,39 @@ class MagiConcatAVLatent(io.ComfyNode):
                 audio_noise_mask = torch.ones_like(audio_latent["samples"])
             output["noise_mask"] = comfy.nested_tensor.NestedTensor((video_noise_mask, audio_noise_mask))
 
-        output["samples"] = comfy.nested_tensor.NestedTensor((video_latent["samples"], audio_latent["samples"]))
+        # VAE produces audio as (B, channels, T), model expects (B, T, channels)
+        audio_samples = audio_latent["samples"]
+        if audio_samples.ndim == 3 and audio_samples.shape[1] == 64:
+            audio_samples = audio_samples.transpose(1, 2)
+        output["samples"] = comfy.nested_tensor.NestedTensor((video_latent["samples"], audio_samples))
+        return io.NodeOutput(output)
+
+
+class MagiPrepareAudioSR(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MagiPrepareAudioSR",
+            category="latent/video/magi",
+            description="Prepare audio latent for MagiHuman SR: mix with noise and freeze (set denoise mask to 0)",
+            inputs=[
+                io.Latent.Input("audio_latent"),
+                io.Float.Input("noise_scale", default=0.7, min=0.0, max=1.0, step=0.01, tooltip="Fraction of noise to mix in (0 = keep original, 1 = pure noise)"),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="audio_latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, audio_latent, noise_scale=0.7) -> io.NodeOutput:
+        output = audio_latent.copy()
+        samples = audio_latent["samples"]
+        if noise_scale > 0:
+            noise = torch.randn_like(samples)
+            samples = noise * noise_scale + samples * (1 - noise_scale)
+        output["samples"] = samples
+        output["noise_mask"] = torch.zeros_like(samples)
         return io.NodeOutput(output)
 
 
@@ -91,7 +122,8 @@ class MagiSeparateAVLatent(io.ComfyNode):
         video_latent = av_latent.copy()
         video_latent["samples"] = latents[0]
         audio_latent = av_latent.copy()
-        audio_latent["samples"] = latents[1]
+        # Model uses (B, T, channels), VAE uses (B, channels, T)
+        audio_latent["samples"] = latents[1].transpose(1, 2)
         if "noise_mask" in av_latent:
             masks = av_latent["noise_mask"]
             if masks is not None:
@@ -101,103 +133,14 @@ class MagiSeparateAVLatent(io.ComfyNode):
         return io.NodeOutput(video_latent, audio_latent)
 
 
-def _build_magi_sigmas(num_steps, shift_scale=5.0, num_timesteps=1000):
-    """Build MagiHuman's FlowUniPCMultistepScheduler sigma schedule.
-    Matches the original: shift applied twice (init + set_timesteps), descending from ~1.0 to 0."""
-    # Step 1: build full schedule with shift applied once (matches scheduler __init__)
-    alphas = np.linspace(1, 1.0 / num_timesteps, num_timesteps)[::-1].copy()
-    sigmas_full = 1.0 - alphas
-    sigmas_full = shift_scale * sigmas_full / (1 + (shift_scale - 1) * sigmas_full)
-
-    sigma_max = sigmas_full[0]
-    sigma_min = sigmas_full[-1]
-
-    # Step 2: subsample and apply shift again (matches set_timesteps)
-    sigmas = np.linspace(sigma_max, sigma_min, num_steps + 1).copy()[:-1]
-    sigmas = shift_scale * sigmas / (1 + (shift_scale - 1) * sigmas)
-
-    sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
-    return torch.from_numpy(sigmas).float()
-
-
-class MagiSigmasNode(io.ComfyNode):
-    """Generate MagiHuman's ZeroSNRDDPM sigma schedule."""
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="MagiSigmas",
-            category="sampling/custom_sampling/schedulers",
-            description="MagiHuman ZeroSNRDDPM sigma schedule (ascending clean-to-noisy-to-clean)",
-            inputs=[
-                io.Int.Input("steps", default=8, min=1, max=100),
-                io.Float.Input("shift_scale", default=5.0, min=0.1, max=20.0, step=0.1),
-            ],
-            outputs=[
-                io.Sigmas.Output("sigmas"),
-            ],
-        )
-
-    @classmethod
-    def execute(cls, steps, shift_scale=5.0) -> io.NodeOutput:
-        sigmas = _build_magi_sigmas(steps, shift_scale)
-        return io.NodeOutput(sigmas)
-
-
-class MagiSamplerNode(io.ComfyNode):
-    """Sampler matching MagiHuman's step_ddim: at each step, predict x_0 from
-    velocity, then re-noise to next sigma level with fresh noise."""
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="MagiSampler",
-            category="sampling/custom_sampling/samplers",
-            description="MagiHuman step_ddim sampler (stochastic, adds fresh noise each step)",
-            inputs=[],
-            outputs=[
-                io.Sampler.Output("sampler"),
-            ],
-        )
-
-    @classmethod
-    def execute(cls) -> io.NodeOutput:
-        from comfy.samplers import KSAMPLER
-        sampler = KSAMPLER(_sample_magi_step_ddim)
-        return io.NodeOutput(sampler)
-
-
-def _sample_magi_step_ddim(model, x, sigmas, extra_args=None, callback=None, disable=None, **kwargs):
-    """MagiHuman step_ddim: stochastic sampler for model without timestep conditioning.
-
-    Always passes sigma=1.0 to model so calculate_denoised gives x_0 = x - 1.0*v
-    (the model's direct prediction). Uses the actual sigmas only for re-noising weights.
-    """
-    from tqdm.auto import trange
-    extra_args = {} if extra_args is None else extra_args
-    s_in = x.new_ones([x.shape[0]])
-
-    for i in trange(len(sigmas) - 1, disable=disable):
-        denoised = model(x, sigmas[i] * s_in, **extra_args)
-        if callback is not None:
-            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
-
-        if sigmas[i + 1] == 0:
-            x = denoised
-        else:
-            # Re-noise using actual schedule sigma for mixing weight
-            noise = torch.randn_like(x)
-            x = sigmas[i + 1] * noise + (1 - sigmas[i + 1]) * denoised
-    return x
-
-
 class MagiExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             EmptyMagiAudioLatent,
             MagiConcatAVLatent,
+            MagiPrepareAudioSR,
             MagiSeparateAVLatent,
-            MagiSigmasNode,
-            MagiSamplerNode,
         ]
 
 async def comfy_entrypoint() -> MagiExtension:

@@ -1011,6 +1011,8 @@ class CFGGuider:
         else:
             latent_shapes = [latent_image.shape]
 
+        self.model_patcher.latent_shapes = latent_shapes
+
         if denoise_mask is not None:
             if denoise_mask.is_nested:
                 denoise_masks = denoise_mask.unbind()
@@ -1055,6 +1057,7 @@ class CFGGuider:
             self.model_options = orig_model_options
             self.model_patcher.hook_mode = orig_hook_mode
             self.model_patcher.restore_hook_patches()
+            self.model_patcher.latent_shapes = None
 
         del self.conds
 

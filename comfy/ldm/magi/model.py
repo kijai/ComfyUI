@@ -12,6 +12,12 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.ops
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+
 
 # ──────────────────────── Activation functions ────────────────────────
 
@@ -203,7 +209,7 @@ class MagiMoELinear(nn.Module):
 class MagiAttention(nn.Module):
     def __init__(self, hidden_size, num_heads_q, num_heads_kv, head_dim,
                  num_modality=1, enable_attn_gating=True, num_layers=40,
-                 operation_settings={}):
+                 use_local_attn=False, operation_settings={}):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads_q = num_heads_q
@@ -211,6 +217,7 @@ class MagiAttention(nn.Module):
         self.head_dim = head_dim
         self.num_modality = num_modality
         self.enable_attn_gating = enable_attn_gating
+        self.use_local_attn = use_local_attn and FLEX_ATTENTION_AVAILABLE
 
         self.gating_size = num_heads_q if enable_attn_gating else 0
         self.q_size = num_heads_q * head_dim
@@ -255,7 +262,14 @@ class MagiAttention(nn.Module):
             k = k.repeat_interleave(self.num_heads_q // self.num_heads_kv, dim=1)
             v = v.repeat_interleave(self.num_heads_q // self.num_heads_kv, dim=1)
 
-        out = optimized_attention(q, k, v, self.num_heads_q, skip_reshape=True)
+        if self.use_local_attn:
+            block_mask = transformer_options.get("local_attn_block_mask", None)
+            if block_mask is not None:
+                out = flex_attention(q, k, v, block_mask=block_mask)
+            else:
+                out = optimized_attention(q, k, v, self.num_heads_q, skip_reshape=True)
+        else:
+            out = optimized_attention(q, k, v, self.num_heads_q, skip_reshape=True)
         out = out.squeeze(0)
 
         out = ModalityDispatcher.permute(out, modality_dispatcher.permute_mapping)
@@ -295,7 +309,8 @@ class MagiMLP(nn.Module):
 class MagiTransformerLayer(nn.Module):
     def __init__(self, hidden_size, num_heads_q, num_heads_kv, head_dim,
                  layer_idx, mm_layers, gelu7_layers, post_norm_layers,
-                 enable_attn_gating=True, num_layers=40, operation_settings={}):
+                 enable_attn_gating=True, num_layers=40, use_local_attn=False,
+                 operation_settings={}):
         super().__init__()
         num_modality = 3 if layer_idx in mm_layers else 1
         self.has_post_norm = layer_idx in post_norm_layers
@@ -303,7 +318,8 @@ class MagiTransformerLayer(nn.Module):
         self.attention = MagiAttention(
             hidden_size=hidden_size, num_heads_q=num_heads_q, num_heads_kv=num_heads_kv,
             head_dim=head_dim, num_modality=num_modality, enable_attn_gating=enable_attn_gating,
-            num_layers=num_layers, operation_settings=operation_settings,
+            num_layers=num_layers, use_local_attn=use_local_attn,
+            operation_settings=operation_settings,
         )
 
         if layer_idx in gelu7_layers:
@@ -374,11 +390,13 @@ class MagiModel(nn.Module):
                  video_in_channels=192,
                  audio_in_channels=64,
                  text_in_channels=3584,
-                 mm_layers=None,
-                 gelu7_layers=None,
-                 post_norm_layers=None,
+                 mm_layers=(0, 1, 2, 3, 36, 37, 38, 39),
+                 gelu7_layers=(0, 1, 2, 3),
+                 post_norm_layers=(),
+                 local_attn_layers=(),
+                 frame_receptive_field=11,
                  enable_attn_gating=True,
-                 patch_size=None,
+                 patch_size=(1, 2, 2),
                  image_model=None,
                  device=None,
                  dtype=None,
@@ -392,18 +410,11 @@ class MagiModel(nn.Module):
         self.audio_in_channels = audio_in_channels
         self.text_in_channels = text_in_channels
 
-        if mm_layers is None:
-            mm_layers = [0, 1, 2, 3, 36, 37, 38, 39]
-        if gelu7_layers is None:
-            gelu7_layers = [0, 1, 2, 3]
-        if post_norm_layers is None:
-            post_norm_layers = []
-        if patch_size is None:
-            patch_size = (1, 2, 2)
-
         self.mm_layers = mm_layers
         self.gelu7_layers = gelu7_layers
         self.post_norm_layers = post_norm_layers
+        self.local_attn_layers = local_attn_layers
+        self.frame_receptive_field = frame_receptive_field
         self.patch_size = patch_size
 
         num_heads_q = hidden_size // head_dim
@@ -424,7 +435,8 @@ class MagiModel(nn.Module):
                 hidden_size=hidden_size, num_heads_q=num_heads_q, num_heads_kv=num_heads_kv,
                 head_dim=head_dim, layer_idx=i, mm_layers=mm_layers, gelu7_layers=gelu7_layers,
                 post_norm_layers=post_norm_layers, enable_attn_gating=enable_attn_gating,
-                num_layers=num_layers, operation_settings=operation_settings,
+                num_layers=num_layers, use_local_attn=i in local_attn_layers,
+                operation_settings=operation_settings,
             )
             for i in range(num_layers)
         ])
@@ -538,15 +550,7 @@ class MagiModel(nn.Module):
                     audio_tok = audio_tok.unsqueeze(0)
             else:
                 num_frames = (T - 1) * 4 + 1
-                cache_key = (num_frames, self.audio_in_channels, b)
-                if not hasattr(self, '_audio_cache') or self._audio_cache.get('key') != cache_key:
-                    gen = torch.Generator(device='cpu')
-                    gen.manual_seed(1234 + b)
-                    self._audio_cache = {
-                        'key': cache_key,
-                        'data': torch.randn(num_frames, self.audio_in_channels, generator=gen, device='cpu'),
-                    }
-                audio_tok = self._audio_cache['data'].to(device=device, dtype=dtype)
+                audio_tok = torch.zeros(num_frames, self.audio_in_channels, device=device, dtype=dtype)
 
             if context is not None:
                 text_tok = context[b]
@@ -577,7 +581,31 @@ class MagiModel(nn.Module):
             dispatcher = ModalityDispatcher(modality_mapping, 3)
             hidden = ModalityDispatcher.permute(hidden, dispatcher.permute_mapping)
 
-            for i, layer in enumerate(self.block.layers):
+            if self.local_attn_layers and FLEX_ATTENTION_AVAILABLE:
+                n_frames = T // self.patch_size[0]
+                n_video = int(video_mask.sum().item())
+                tokens_per_frame = n_video // n_frames
+                total_tokens = hidden.shape[0]
+                receptive_field = self.frame_receptive_field
+
+                def local_mask_fn(_b, _h, q_idx, kv_idx):
+                    q_is_video = q_idx < n_video
+                    kv_is_video = kv_idx < n_video
+                    q_frame = q_idx // tokens_per_frame
+                    kv_frame = kv_idx // tokens_per_frame
+                    in_window = (kv_frame >= q_frame - receptive_field) & (kv_frame <= q_frame + receptive_field)
+                    # Video queries: attend to nearby video frames + all non-video tokens
+                    # Non-video queries: attend to everything
+                    return ~q_is_video | ~kv_is_video | in_window
+
+                block_mask = create_block_mask(
+                    local_mask_fn, B=1, H=None,
+                    Q_LEN=total_tokens, KV_LEN=total_tokens,
+                    device=hidden.device,
+                )
+                transformer_options = {**transformer_options, "local_attn_block_mask": block_mask}
+
+            for _, layer in enumerate(self.block.layers):
                 hidden = layer(hidden, rope, dispatcher, transformer_options)
 
             hidden = ModalityDispatcher.inv_permute(hidden, dispatcher.inv_permute_mapping)

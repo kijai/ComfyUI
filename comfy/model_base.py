@@ -18,7 +18,6 @@
 
 import comfy.ldm.hunyuan3dv2_1
 import comfy.ldm.hunyuan3dv2_1.hunyuandit
-import comfy.ldm.magi.model
 import torch
 import logging
 import comfy.ldm.lightricks.av_model
@@ -53,6 +52,7 @@ import comfy.ldm.qwen_image.model
 import comfy.ldm.kandinsky5.model
 import comfy.ldm.anima.model
 import comfy.ldm.ace.ace_step15
+import comfy.ldm.magi.model
 
 import comfy.model_management
 import comfy.patcher_extension
@@ -1975,52 +1975,29 @@ class MagiHuman(BaseModel):
 
         return out
 
-    def _find_video_component(self, latent_shapes):
-        """Find the video component index in packed latent_shapes by matching channel count."""
-        target_channels = self.latent_format.latent_channels  # 48 for Wan22
-        for i, shape in enumerate(latent_shapes):
-            if len(shape) == 5 and shape[1] == target_channels:
-                return i
-        return None
-
     def _packed_process(self, latent, latent_shapes, fn):
-        """Apply fn (process_in or process_out) to only the video component of a packed tensor."""
-        video_idx = self._find_video_component(latent_shapes)
-        if video_idx is None:
-            return fn(latent)
-        # Compute offset to video component
-        offset = 0
-        for i in range(video_idx):
-            flat = 1
-            for s in latent_shapes[i][1:]:
-                flat *= s
-            offset += flat
-        video_flat = 1
-        for s in latent_shapes[video_idx][1:]:
-            video_flat *= s
-        result = latent.clone()
-        video = result[:, :, offset:offset + video_flat].reshape(latent_shapes[video_idx])
-        video = fn(video)
-        result[:, :, offset:offset + video_flat] = video.reshape(result.shape[0], 1, -1)
+        """Apply fn to only the 5D (video) components of a packed tensor, leaving others unchanged."""
+        dims = self.latent_format.latent_dimensions + 2
+        components = utils.unpack_latents(latent, latent_shapes)
+        processed = [fn(c) if len(s) == dims else c for c, s in zip(components, latent_shapes)]
+        result, _ = utils.pack_latents(processed)
         return result
 
     def process_latent_in(self, latent, **kwargs):
+        if latent.ndim != 3:
+            return self.latent_format.process_in(latent)
         latent_shapes = kwargs.get("latent_shapes", None)
-        if latent.ndim == 3 and latent_shapes is not None:
-            return self._packed_process(latent, latent_shapes, self.latent_format.process_in)
-        if latent.ndim == 3:
-            # Packed tensor without shapes — can't safely normalize, return as-is
+        if latent_shapes is None:
             return latent
-        return self.latent_format.process_in(latent)
+        return self._packed_process(latent, latent_shapes, self.latent_format.process_in)
 
     def process_latent_out(self, latent, **kwargs):
+        if latent.ndim != 3:
+            return self.latent_format.process_out(latent)
         latent_shapes = kwargs.get("latent_shapes", None)
-        if latent.ndim == 3 and latent_shapes is not None:
-            return self._packed_process(latent, latent_shapes, self.latent_format.process_out)
-        if latent.ndim == 3:
-            # Packed tensor without shapes — can't safely denormalize, return as-is
+        if latent_shapes is None:
             return latent
-        return self.latent_format.process_out(latent)
+        return self._packed_process(latent, latent_shapes, self.latent_format.process_out)
 
     def scale_latent_inpaint(self, sigma, noise, latent_image, **kwargs):
         # MagiHuman I2V: first frame is hard-replaced every step (no noise mixing)
