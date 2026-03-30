@@ -53,6 +53,7 @@ import comfy.ldm.kandinsky5.model
 import comfy.ldm.anima.model
 import comfy.ldm.ace.ace_step15
 import comfy.ldm.rt_detr.rtdetr_v4
+import comfy.ldm.sam3.detector
 
 import comfy.model_management
 import comfy.patcher_extension
@@ -1962,3 +1963,7 @@ class Kandinsky5Image(Kandinsky5):
 class RT_DETR_v4(BaseModel):
     def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
         super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.rt_detr.rtdetr_v4.RTv4)
+
+class SAM3(BaseModel):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.sam3.detector.SAM3Model)

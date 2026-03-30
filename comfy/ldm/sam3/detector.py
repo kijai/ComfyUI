@@ -1,0 +1,458 @@
+# SAM3 detector: transformer encoder-decoder, segmentation head, geometry encoder, scoring.
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.sam3.tracker import SAM3Tracker
+from comfy.ldm.sam3.backbone import SAM3VisionBackbone
+from comfy.ops import cast_to_input
+
+
+def box_cxcywh_to_xyxy(x):
+    cx, cy, w, h = x.unbind(-1)
+    return torch.stack([cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h], dim=-1)
+
+
+def gen_sineembed_for_position(pos_tensor, num_feats=256):
+    """Per-coordinate sinusoidal embedding: (..., N) -> (..., N * num_feats)."""
+    assert num_feats % 2 == 0
+    hdim = num_feats // 2
+    freqs = 10000.0 ** (2 * (torch.arange(hdim, dtype=torch.float32, device=pos_tensor.device) // 2) / hdim)
+    embeds = []
+    for c in range(pos_tensor.shape[-1]):
+        raw = (pos_tensor[..., c].float() * 2 * math.pi).unsqueeze(-1) / freqs
+        embeds.append(torch.stack([raw[..., 0::2].sin(), raw[..., 1::2].cos()], dim=-1).flatten(-2))
+    return torch.cat(embeds, dim=-1).to(pos_tensor.dtype)
+
+
+class SplitMHA(nn.Module):
+    """Multi-head attention with separate Q/K/V projections (split from fused in_proj_weight)."""
+    def __init__(self, d_model, num_heads=8, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.num_heads = num_heads
+        self.q_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.out_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+
+    def forward(self, q_input, k_input=None, v_input=None, mask=None):
+        q = self.q_proj(q_input)
+        if k_input is None:
+            k = self.k_proj(q_input)
+            v = self.v_proj(q_input)
+        else:
+            k = self.k_proj(k_input)
+            v = self.v_proj(v_input if v_input is not None else k_input)
+        dtype = q.dtype  # manual_cast may produce mixed dtypes
+        out = optimized_attention(q, k.to(dtype), v.to(dtype), self.num_heads, mask=mask)
+        return self.out_proj(out)
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, device=None, dtype=None, operations=None):
+        super().__init__()
+        dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
+        self.layers = nn.ModuleList([
+            operations.Linear(dims[i], dims[i + 1], device=device, dtype=dtype)
+            for i in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:
+                x = F.relu(x)
+        return x
+
+
+class MLPWithNorm(nn.Module):
+    """MLP with residual connection and output LayerNorm."""
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, residual=True, device=None, dtype=None, operations=None):
+        super().__init__()
+        dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
+        self.layers = nn.ModuleList([
+            operations.Linear(dims[i], dims[i + 1], device=device, dtype=dtype)
+            for i in range(num_layers)
+        ])
+        self.out_norm = operations.LayerNorm(output_dim, device=device, dtype=dtype)
+        self.residual = residual and (input_dim == output_dim)
+
+    def forward(self, x):
+        orig = x
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:
+                x = F.relu(x)
+        if self.residual:
+            x = x + orig
+        return self.out_norm(x)
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.self_attn = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.cross_attn_image = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.linear1 = operations.Linear(d_model, dim_ff, device=device, dtype=dtype)
+        self.linear2 = operations.Linear(dim_ff, d_model, device=device, dtype=dtype)
+        self.norm1 = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.norm2 = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.norm3 = operations.LayerNorm(d_model, device=device, dtype=dtype)
+
+    def forward(self, src, pos, text_memory=None, text_mask=None):
+        # Pre-norm
+        src2 = self.norm1(src)
+        q_k = src2 + pos
+        src2 = self.self_attn(q_k, q_k, src2)
+        src = src + src2
+        if text_memory is not None:
+            src2 = self.norm2(src)
+            src2 = self.cross_attn_image(src2, text_memory, text_memory, mask=text_mask)
+            src = src + src2
+        # FFN
+        src2 = self.norm3(src)
+        src2 = self.linear2(F.relu(self.linear1(src2)))
+        src = src + src2
+        return src
+
+
+class TransformerEncoder(nn.Module):
+    """Checkpoint: transformer.encoder.layers.N.*"""
+    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, num_layers=6, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, dim_ff, device=device, dtype=dtype, operations=operations)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, src, pos, text_memory=None, text_mask=None):
+        for layer in self.layers:
+            src = layer(src, pos, text_memory, text_mask)
+        return src
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.self_attn = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.cross_attn = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.ca_text = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.norm1 = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.norm2 = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.norm3 = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.catext_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.linear1 = operations.Linear(d_model, dim_ff, device=device, dtype=dtype)
+        self.linear2 = operations.Linear(dim_ff, d_model, device=device, dtype=dtype)
+
+    def forward(self, tgt, memory, tgt_pos, memory_pos, text_memory=None, text_mask=None, cross_attn_bias=None):
+        # Post-norm: self-attn → text cross-attn → image cross-attn → FFN
+        q_k = tgt + tgt_pos
+        tgt = self.norm2(tgt + self.self_attn(q_k, q_k, tgt))
+        if text_memory is not None:
+            tgt = self.catext_norm(tgt + self.ca_text(tgt + tgt_pos, text_memory, text_memory, mask=text_mask))
+        tgt = self.norm1(tgt + self.cross_attn(tgt + tgt_pos, memory + memory_pos, memory, mask=cross_attn_bias))
+        tgt2 = self.linear2(F.relu(self.linear1(tgt)))
+        tgt = tgt + tgt2
+        tgt = self.norm3(tgt)
+        return tgt
+
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, num_layers=6,
+                 num_queries=200, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.d_model = d_model
+        self.num_queries = num_queries
+
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, dim_ff, device=device, dtype=dtype, operations=operations)
+            for _ in range(num_layers)
+        ])
+        self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.query_embed = operations.Embedding(num_queries, d_model, device=device, dtype=dtype)
+        self.reference_points = operations.Embedding(num_queries, 4, device=device, dtype=dtype) # Reference points: Embedding(num_queries, 4) — learned anchor boxes
+        self.ref_point_head = MLP(d_model * 2, d_model, d_model, 2, device=device, dtype=dtype, operations=operations) # ref_point_head input: 512 (4 coords * 128 sine features each)
+        self.bbox_embed = MLP(d_model, d_model, 4, 3, device=device, dtype=dtype, operations=operations)
+
+        self.boxRPB_embed_x = MLP(2, d_model, num_heads, 2, device=device, dtype=dtype, operations=operations)
+        self.boxRPB_embed_y = MLP(2, d_model, num_heads, 2, device=device, dtype=dtype, operations=operations)
+
+        self.presence_token = operations.Embedding(1, d_model, device=device, dtype=dtype)
+        self.presence_token_head = MLP(d_model, d_model, 1, 3, device=device, dtype=dtype, operations=operations)
+        self.presence_token_out_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+
+    def _compute_box_rpb(self, ref_points, H, W):
+        """Box rotary position bias: (B, Q, 4) cxcywh -> (B, n_heads, Q+1, H*W) bias."""
+        boxes_xyxy = box_cxcywh_to_xyxy(ref_points)
+        B, Q, _ = boxes_xyxy.shape
+        coords_h = torch.arange(H, device=ref_points.device, dtype=torch.float32) / H
+        coords_w = torch.arange(W, device=ref_points.device, dtype=torch.float32) / W
+        deltas_x = coords_w.view(1, 1, -1, 1) - boxes_xyxy[:, :, None, 0:3:2]
+        deltas_y = coords_h.view(1, 1, -1, 1) - boxes_xyxy[:, :, None, 1:4:2]
+
+        log2_8 = float(math.log2(8))
+        def log_scale(d):
+            return torch.sign(d * 8) * torch.log2(torch.abs(d * 8) + 1.0) / log2_8
+
+        rpb_x = self.boxRPB_embed_x(log_scale(deltas_x).to(ref_points.dtype))
+        rpb_y = self.boxRPB_embed_y(log_scale(deltas_y).to(ref_points.dtype))
+
+        bias = (rpb_y.unsqueeze(3) + rpb_x.unsqueeze(2)).flatten(2, 3).permute(0, 3, 1, 2)
+        pres_bias = torch.zeros(B, bias.shape[1], 1, bias.shape[3], device=bias.device, dtype=bias.dtype)
+        return torch.cat([pres_bias, bias], dim=2)
+
+    def forward(self, memory, memory_pos, text_memory=None, text_mask=None, H=72, W=72):
+        B = memory.shape[0]
+        tgt = cast_to_input(self.query_embed.weight, memory).unsqueeze(0).expand(B, -1, -1)
+        presence_out = cast_to_input(self.presence_token.weight, memory)[None].expand(B, -1, -1)
+        ref_points = cast_to_input(self.reference_points.weight, memory).unsqueeze(0).expand(B, -1, -1).sigmoid()
+
+        for layer_idx, layer in enumerate(self.layers):
+            query_pos = self.ref_point_head(gen_sineembed_for_position(ref_points, self.d_model))
+            tgt_with_pres = torch.cat([presence_out, tgt], dim=1)
+            pos_with_pres = torch.cat([torch.zeros_like(presence_out), query_pos], dim=1)
+            tgt_with_pres = layer(tgt_with_pres, memory, pos_with_pres, memory_pos,
+                                  text_memory, text_mask, self._compute_box_rpb(ref_points, H, W))
+            presence_out, tgt = tgt_with_pres[:, :1], tgt_with_pres[:, 1:]
+            if layer_idx < len(self.layers) - 1:
+                ref_inv = torch.log(ref_points / (1 - ref_points + 1e-6) + 1e-6)
+                ref_points = (ref_inv + self.bbox_embed(self.norm(tgt))).sigmoid().detach()
+
+        query_out = self.norm(tgt)
+        ref_inv = torch.log(ref_points / (1 - ref_points + 1e-6) + 1e-6)
+        boxes = (ref_inv + self.bbox_embed(query_out)).sigmoid()
+        presence = self.presence_token_head(self.presence_token_out_norm(presence_out)).squeeze(-1)
+        return {"decoder_output": query_out, "pred_boxes": boxes, "presence": presence}
+
+
+class Transformer(nn.Module):
+    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, enc_layers=6, dec_layers=6,
+                 num_queries=200, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.encoder = TransformerEncoder(d_model, num_heads, dim_ff, enc_layers, device=device, dtype=dtype, operations=operations)
+        self.decoder = TransformerDecoder(d_model, num_heads, dim_ff, dec_layers, num_queries, device=device, dtype=dtype, operations=operations)
+
+
+class GeometryEncoder(nn.Module):
+    def __init__(self, d_model=256, num_heads=8, num_layers=3, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.points_direct_project = operations.Linear(2, d_model, device=device, dtype=dtype)
+        self.points_pool_project = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.points_pos_enc_project = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.boxes_direct_project = operations.Linear(4, d_model, device=device, dtype=dtype)
+        self.boxes_pool_project = operations.Conv2d(d_model, d_model, kernel_size=7, device=device, dtype=dtype)
+        self.boxes_pos_enc_project = operations.Linear(d_model + 2, d_model, device=device, dtype=dtype)  # 258 input
+        self.label_embed = operations.Embedding(2, d_model, device=device, dtype=dtype)  # 2 labels
+        self.cls_embed = operations.Embedding(1, d_model, device=device, dtype=dtype)
+        self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.img_pre_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.encode = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, 2048, device=device, dtype=dtype, operations=operations)
+            for _ in range(num_layers)
+        ])
+        self.encode_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.final_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+
+    def forward(self, points=None, boxes=None, image_features=None):
+        embeddings = []
+        if points is not None:
+            coords, labels = points
+            embed = self.points_direct_project(coords)
+            embeddings.append(embed)
+        if boxes is not None:
+            embed = self.boxes_direct_project(boxes)
+            embeddings.append(embed)
+        if not embeddings:
+            return None
+        geo = torch.cat(embeddings, dim=1)
+        geo = self.norm(geo)
+        if image_features is not None:
+            img = self.img_pre_norm(image_features)
+            for layer in self.encode:
+                geo = layer(geo, torch.zeros_like(geo), img)
+        geo = self.encode_norm(geo)
+        return self.final_proj(geo)
+
+
+class PixelDecoder(nn.Module):
+    """Top-down FPN pixel decoder with GroupNorm + ReLU + nearest interpolation."""
+    def __init__(self, d_model=256, num_stages=3, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.conv_layers = nn.ModuleList([operations.Conv2d(d_model, d_model, kernel_size=3, padding=1, device=device, dtype=dtype) for _ in range(num_stages)])
+        self.norms = nn.ModuleList([operations.GroupNorm(8, d_model, device=device, dtype=dtype) for _ in range(num_stages)])
+
+    def forward(self, backbone_features):
+        prev = backbone_features[-1]
+        for i, feat in enumerate(backbone_features[:-1][::-1]):
+            prev = F.relu(self.norms[i](self.conv_layers[i](feat + F.interpolate(prev, size=feat.shape[-2:], mode="nearest"))))
+        return prev
+
+
+class MaskPredictor(nn.Module):
+    def __init__(self, d_model=256, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.mask_embed = MLP(d_model, d_model, d_model, 3, device=device, dtype=dtype, operations=operations)
+
+    def forward(self, query_embeddings, pixel_features):
+        mask_embed = self.mask_embed(query_embeddings)
+        return torch.einsum("bqc,bchw->bqhw", mask_embed, pixel_features)
+
+
+class SegmentationHead(nn.Module):
+    def __init__(self, d_model=256, num_heads=8, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.d_model = d_model
+        self.pixel_decoder = PixelDecoder(d_model, 3, device=device, dtype=dtype, operations=operations)
+        self.mask_predictor = MaskPredictor(d_model, device=device, dtype=dtype, operations=operations)
+        self.cross_attend_prompt = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.cross_attn_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.instance_seg_head = operations.Conv2d(d_model, d_model, kernel_size=1, device=device, dtype=dtype)
+        self.semantic_seg_head = operations.Conv2d(d_model, 1, kernel_size=1, device=device, dtype=dtype)
+
+    def forward(self, query_embeddings, backbone_features, encoder_hidden_states=None, prompt=None, prompt_mask=None):
+        if encoder_hidden_states is not None and prompt is not None:
+            enc_normed = self.cross_attn_norm(encoder_hidden_states)
+            enc_cross = self.cross_attend_prompt(enc_normed, prompt, prompt, mask=prompt_mask)
+            encoder_hidden_states = enc_cross + encoder_hidden_states
+
+        if encoder_hidden_states is not None:
+            B, H, W = encoder_hidden_states.shape[0], backbone_features[-1].shape[-2], backbone_features[-1].shape[-1]
+            encoder_visual = encoder_hidden_states[:, :H * W].permute(0, 2, 1).view(B, self.d_model, H, W)
+            backbone_features = list(backbone_features)
+            backbone_features[-1] = encoder_visual
+
+        pixel_features = self.pixel_decoder(backbone_features)
+        instance_features = self.instance_seg_head(pixel_features)
+        masks = self.mask_predictor(query_embeddings, instance_features)
+        return masks
+
+
+class DotProductScoring(nn.Module):
+    def __init__(self, d_model=256, device=None, dtype=None, operations=None):
+        super().__init__()
+        self.hs_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.prompt_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.prompt_mlp = MLPWithNorm(d_model, 2048, d_model, 2, device=device, dtype=dtype, operations=operations)
+        self.scale = 1.0 / (d_model ** 0.5)
+
+    def forward(self, query_embeddings, prompt_embeddings, prompt_mask=None):
+        prompt = self.prompt_mlp(prompt_embeddings)
+        if prompt_mask is not None:
+            weight = prompt_mask.unsqueeze(-1).to(dtype=prompt.dtype)
+            pooled = (prompt * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1)
+        else:
+            pooled = prompt.mean(dim=1)
+        hs = self.hs_proj(query_embeddings)
+        pp = self.prompt_proj(pooled).unsqueeze(-1).to(hs.dtype)
+        scores = torch.matmul(hs, pp)
+        return (scores * self.scale).clamp(-12.0, 12.0).squeeze(-1)
+
+
+class SAM3Detector(nn.Module):
+    def __init__(self, d_model=256, embed_dim=1024, num_queries=200, device=None, dtype=None, operations=None, **kwargs):
+        super().__init__()
+        self.dtype = dtype
+        for k in ("num_heads", "num_head_channels", "image_model"):
+            kwargs.pop(k, None)
+        self.backbone = nn.ModuleDict({
+            "vision_backbone": SAM3VisionBackbone(embed_dim=embed_dim, d_model=d_model, device=device, dtype=dtype, operations=operations, **kwargs),
+            "language_backbone": nn.ModuleDict({"resizer": operations.Linear(embed_dim, d_model, device=device, dtype=dtype)}),
+        })
+        self.transformer = Transformer(d_model=d_model, num_queries=num_queries, device=device, dtype=dtype, operations=operations)
+        self.segmentation_head = SegmentationHead(d_model=d_model, device=device, dtype=dtype, operations=operations)
+        self.geometry_encoder = GeometryEncoder(d_model=d_model, device=device, dtype=dtype, operations=operations)
+        self.dot_prod_scoring = DotProductScoring(d_model=d_model, device=device, dtype=dtype, operations=operations)
+
+    @staticmethod
+    def _run_geo_layer(layer, tgt, memory, memory_pos):
+        """Pre-norm encoder layer with pos_enc_at_cross_attn_keys=True only."""
+        tgt = tgt + layer.self_attn(layer.norm1(tgt), layer.norm1(tgt), layer.norm1(tgt))
+        tgt = tgt + layer.cross_attn_image(layer.norm2(tgt), memory + memory_pos, memory)
+        tgt = tgt + layer.linear2(F.relu(layer.linear1(layer.norm3(tgt))))
+        return tgt
+
+    def forward(self, images, text_embeddings=None, text_mask=None, points=None, boxes=None, threshold=0.3, orig_size=None):
+        B = images.shape[0]
+        all_features, all_positions, sam2_features, sam2_positions = self.backbone["vision_backbone"](images, need_tracker=True)
+        self._cached_tracker_features = (sam2_features, sam2_positions)
+        features = all_features[:-1]  # scalp=1: drop 0.5x level
+        positions = all_positions[:-1]
+
+        if text_embeddings is not None:
+            text_embeddings = self.backbone["language_backbone"]["resizer"](text_embeddings)
+            if text_mask is not None:
+                text_mask = text_mask.bool()
+
+        enc_feat, enc_pos = features[-1], positions[-1]
+        _, _, H, W = enc_feat.shape
+        img_flat = enc_feat.flatten(2).permute(0, 2, 1)
+        pos_flat = enc_pos.flatten(2).permute(0, 2, 1)
+
+        # Build prompt tokens: text + geometry + cls
+        has_prompts = text_embeddings is not None or points is not None or boxes is not None
+        if has_prompts:
+            geo_enc = self.geometry_encoder
+            geo_prompts = geo_enc(points=points, boxes=boxes, image_features=img_flat)
+            geo_cls = geo_enc.norm(geo_enc.final_proj(cast_to_input(geo_enc.cls_embed.weight, img_flat).view(1, 1, -1).expand(B, -1, -1)))
+            for layer in geo_enc.encode:
+                geo_cls = self._run_geo_layer(layer, geo_cls, img_flat, pos_flat)
+            geo_cls = geo_enc.encode_norm(geo_cls)
+            parts = [t for t in [text_embeddings, geo_prompts, geo_cls] if t is not None]
+            text_embeddings = torch.cat(parts, dim=1)
+            n_new = text_embeddings.shape[1] - (text_mask.shape[1] if text_mask is not None else 0)
+            if text_mask is not None:
+                text_mask = torch.cat([text_mask, torch.ones(B, n_new, dtype=torch.bool, device=text_mask.device)], dim=1)
+            else:
+                text_mask = torch.ones(B, text_embeddings.shape[1], dtype=torch.bool, device=text_embeddings.device)
+        memory = self.transformer.encoder(img_flat, pos_flat, text_embeddings, text_mask)
+        dec_out = self.transformer.decoder(memory, pos_flat, text_embeddings, text_mask, H, W)
+        query_out, pred_boxes = dec_out["decoder_output"], dec_out["pred_boxes"]
+
+        if text_embeddings is not None:
+            scores = self.dot_prod_scoring(query_out, text_embeddings, text_mask)
+        else:
+            scores = torch.zeros(B, query_out.shape[1], device=query_out.device)
+
+        masks = self.segmentation_head(query_out, features, encoder_hidden_states=memory, prompt=text_embeddings, prompt_mask=text_mask)
+
+        cx, cy, w, h = pred_boxes.unbind(-1)
+        boxes_xyxy = torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], dim=-1)
+        if orig_size is not None:
+            oh, ow = orig_size
+            boxes_xyxy = boxes_xyxy * torch.tensor([ow, oh, ow, oh], device=boxes_xyxy.device, dtype=boxes_xyxy.dtype)
+            masks = F.interpolate(masks, size=orig_size, mode="bilinear", align_corners=False)
+
+        return {
+            "boxes": boxes_xyxy,
+            "scores": scores,
+            "masks": masks,
+            "presence": dec_out.get("presence"),
+        }
+
+class SAM3Model(nn.Module):
+    def __init__(self, device=None, dtype=None, operations=None, **kwargs):
+        super().__init__()
+        self.dtype = dtype
+        self.detector = SAM3Detector(device=device, dtype=dtype, operations=operations, **kwargs)
+        self.tracker = SAM3Tracker(device=device, dtype=dtype, operations=operations, **kwargs)
+
+    def forward(self, images, **kwargs):
+        return self.detector(images, **kwargs)
+
+    def forward_video(self, images, initial_mask, pbar=None):
+        # Reuse tracker features cached from detection on frame 0
+        cached = getattr(self.detector, '_cached_tracker_features', None)
+        self.detector._cached_tracker_features = None
+        def backbone_fn(frame):
+            nonlocal cached
+            if cached is not None:
+                out = cached
+                cached = None
+                return out
+            _, _, s2f, s2p = self.detector.backbone["vision_backbone"](frame, need_tracker=True)
+            return s2f, s2p
+        return self.tracker.track_video(backbone_fn, images, initial_mask, pbar=pbar)
