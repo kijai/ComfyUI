@@ -490,19 +490,35 @@ class MagiModel(nn.Module):
         pt, ph, pw = self.patch_size
         t_p, h_p, w_p = T // pt, H // ph, W // pw
 
+        # Detect SR mode: 540p+ uses v1 coords, base (256p) uses v2
+        # 540p = 960x540 -> latent 60x34 = 2040, base 448x256 -> latent 28x16 = 448
+        is_sr = (H * W) >= 1024
+        coords_style = "v1" if is_sr else "v2"
+
         video_coords = get_coords(
             shape=(t_p, h_p, w_p), ref_feat_shape=(t_p, h_p, w_p),
             device=device, dtype=dtype,
         )
-        magic_audio_ref_t = (n_audio - 1) // 4 + 1
-        audio_coords = get_coords(
-            shape=(n_audio, 1, 1), ref_feat_shape=(magic_audio_ref_t // pt, 1, 1),
-            device=device, dtype=dtype,
-        )
-        text_coords = get_coords(
-            shape=(n_text, 1, 1), ref_feat_shape=(1, 1, 1),
-            offset_thw=(-n_text, 0, 0), device=device, dtype=dtype,
-        )
+
+        if coords_style == "v2":
+            magic_audio_ref_t = (n_audio - 1) // 4 + 1
+            audio_coords = get_coords(
+                shape=(n_audio, 1, 1), ref_feat_shape=(magic_audio_ref_t // pt, 1, 1),
+                device=device, dtype=dtype,
+            )
+            text_coords = get_coords(
+                shape=(n_text, 1, 1), ref_feat_shape=(1, 1, 1),
+                offset_thw=(-n_text, 0, 0), device=device, dtype=dtype,
+            )
+        else:  # v1 (SR)
+            audio_coords = get_coords(
+                shape=(n_audio, 1, 1), ref_feat_shape=(t_p, 1, 1),
+                device=device, dtype=dtype,
+            )
+            text_coords = get_coords(
+                shape=(n_text, 1, 1), ref_feat_shape=(2, 1, 1),
+                offset_thw=(0, 0, 0), device=device, dtype=dtype,
+            )
 
         return torch.cat([video_coords, audio_coords, text_coords], dim=0)
 
