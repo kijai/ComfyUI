@@ -1,5 +1,7 @@
 # SAM components shared by detector and tracker
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,7 +54,7 @@ class TwoWayAttentionBlock(nn.Module):
 
     def forward(self, queries, keys, query_pe, key_pe):
         if self.skip_first_layer_pe:
-            queries = self.norm1(queries + self.self_attn(queries, queries, queries))
+            queries = self.norm1(self.self_attn(queries, queries, queries))
         else:
             q = queries + query_pe
             queries = self.norm1(queries + self.self_attn(q, q, queries))
@@ -78,7 +80,7 @@ class TwoWayTransformer(nn.Module):
     def forward(self, image_embedding, image_pe, point_embedding):
         queries, keys = point_embedding, image_embedding
         for layer in self.layers:
-            queries, keys = layer(queries, keys, queries, image_pe)
+            queries, keys = layer(queries, keys, point_embedding, image_pe)
         q, k = queries + point_embedding, keys + image_pe
         queries = self.norm_final(queries + self.final_attn_token_to_image(q, k, keys))
         return queries, keys
@@ -94,7 +96,7 @@ class PositionEmbeddingRandom(nn.Module):
         """Map normalized [0,1] coordinates to fourier features via random projection. Computes in fp32."""
         orig_dtype = normalized_coords.dtype
         proj_matrix = self.positional_encoding_gaussian_matrix.to(device=normalized_coords.device, dtype=torch.float32)
-        projected = (2 * normalized_coords.float() - 1) @ proj_matrix
+        projected = 2 * math.pi * (2 * normalized_coords.float() - 1) @ proj_matrix
         return torch.cat([projected.sin(), projected.cos()], dim=-1).to(orig_dtype)
 
     def forward(self, size):

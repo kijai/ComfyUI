@@ -4,6 +4,7 @@ SAM3 (Segment Anything 3) ComfyUI nodes for detection, segmentation, and video t
 
 from typing_extensions import override
 
+import json
 import torch
 import torch.nn.functional as F
 import comfy.model_management
@@ -12,7 +13,7 @@ from comfy_api.latest import ComfyExtension, io
 
 
 class SAM3_Detect(io.ComfyNode):
-    """Open-vocabulary detection + segmentation using text prompts."""
+    """Open-vocabulary detection and segmentation using text, box, or point prompts."""
 
     @classmethod
     def define_schema(cls):
@@ -20,11 +21,14 @@ class SAM3_Detect(io.ComfyNode):
             node_id="SAM3_Detect",
             display_name="SAM3 Detect",
             category="detection/",
-            search_aliases=["sam3", "segment anything", "open vocabulary", "text detection"],
+            search_aliases=["sam3", "segment anything", "open vocabulary", "text detection", "segment"],
             inputs=[
                 io.Model.Input("model", display_name="model"),
                 io.Image.Input("image", display_name="image"),
-                io.Conditioning.Input("conditioning", display_name="conditioning", tooltip="Text conditioning from CLIPTextEncode"),
+                io.Conditioning.Input("conditioning", display_name="conditioning", optional=True, tooltip="Text conditioning from CLIPTextEncode"),
+                io.BoundingBox.Input("bboxes", display_name="bboxes", force_input=True, optional=True, tooltip="Bounding boxes to segment within"),
+                io.String.Input("positive_coords", display_name="positive_coords", force_input=True, optional=True, tooltip="Positive point prompts as JSON [{\"x\": int, \"y\": int}, ...] (pixel coords)"),
+                io.String.Input("negative_coords", display_name="negative_coords", force_input=True, optional=True, tooltip="Negative point prompts as JSON [{\"x\": int, \"y\": int}, ...] (pixel coords)"),
                 io.Float.Input("threshold", display_name="threshold", default=0.3, min=0.0, max=1.0, step=0.01),
                 io.Int.Input("max_detections", display_name="max_detections", default=50, min=1, max=200),
             ],
@@ -35,117 +39,26 @@ class SAM3_Detect(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, image, conditioning, threshold, max_detections) -> io.NodeOutput:
+    def execute(cls, model, image, conditioning=None, bboxes=None, positive_coords=None, negative_coords=None, threshold=0.3, max_detections=50) -> io.NodeOutput:
         B, H, W, C = image.shape
 
-        # Preprocess image to model input size (1008x1008)
         image_in = comfy.utils.common_upscale(image.movedim(-1, 1), 1008, 1008, "bilinear", crop="disabled")
 
         # Extract text embeddings and attention mask from conditioning
         text_embeddings = None
         text_mask = None
         if conditioning is not None and len(conditioning) > 0:
-            cond_tensor = conditioning[0][0]  # (1, T, C) conditioning tensor
+            cond_tensor = conditioning[0][0]
             cond_meta = conditioning[0][1]
             text_embeddings = cond_tensor
-            # Extract attention mask (1=valid, 0=padding) from CLIP
             if "attention_mask" in cond_meta:
-                text_mask = cond_meta["attention_mask"]  # (1, T) int, 1=valid
+                text_mask = cond_meta["attention_mask"]
             else:
-                # Fallback: assume all valid
                 text_mask = torch.ones(cond_tensor.shape[0], cond_tensor.shape[1], dtype=torch.int64, device=cond_tensor.device)
 
-        comfy.model_management.load_model_gpu(model)
-        device = comfy.model_management.get_torch_device()
-        dtype = model.model.get_dtype()
-        image_in = image_in.to(device=device, dtype=dtype)
-        if text_embeddings is not None:
-            text_embeddings = text_embeddings.to(device=device, dtype=dtype)
-        if text_mask is not None:
-            text_mask = text_mask.to(device)
-        results = model.model.diffusion_model(
-            image_in,
-            text_embeddings=text_embeddings,
-            text_mask=text_mask,
-            threshold=threshold,
-            orig_size=(H, W),
-        )
-
-        boxes = results["boxes"]  # (B, Q, 4) xyxy
-        scores = results["scores"]  # (B, Q)
-        masks = results["masks"]  # (B, Q, H, W)
-
-        all_bbox_dicts = []
-        all_masks = []
-
-        for b in range(B):
-            keep = scores[b] > threshold
-            b_boxes = boxes[b][keep].cpu()
-            b_scores = scores[b][keep].cpu()
-            b_masks = masks[b][keep]  # (K, H, W)
-
-            # Sort by score and limit
-            order = b_scores.argsort(descending=True)[:max_detections]
-            b_boxes = b_boxes[order]
-            b_scores = b_scores[order]
-            b_masks = b_masks[order]
-
-            bbox_dicts = [
-                {
-                    "x": float(box[0]),
-                    "y": float(box[1]),
-                    "width": float(box[2] - box[0]),
-                    "height": float(box[3] - box[1]),
-                    "score": float(score),
-                }
-                for box, score in zip(b_boxes, b_scores)
-            ]
-            all_bbox_dicts.append(bbox_dicts)
-            all_masks.append(b_masks)
-
-        if all_masks and all_masks[0].shape[0] > 0:
-            if B == 1:
-                # Single image: return all detection masks
-                mask_out = (all_masks[0] > 0).float()
-            else:
-                # Batch: return best detection mask per image
-                mask_out = torch.stack([(m[0] > 0).float() if m.shape[0] > 0 else torch.zeros(H, W, device=m.device) for m in all_masks])
-        else:
-            mask_out = torch.zeros((B, H, W), device=comfy.model_management.intermediate_device())
-
-        return io.NodeOutput(all_bbox_dicts, mask_out)
-
-
-class SAM3_Segment(io.ComfyNode):
-    """Interactive segmentation using point or box prompts."""
-
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="SAM3_Segment",
-            display_name="SAM3 Segment",
-            category="detection/",
-            search_aliases=["sam3", "segment", "mask", "interactive"],
-            inputs=[
-                io.Model.Input("model", display_name="model"),
-                io.Image.Input("image", display_name="image"),
-                io.BoundingBox.Input("bboxes", display_name="bboxes", optional=True, tooltip="Bounding boxes to segment within"),
-            ],
-            outputs=[
-                io.Mask.Output("masks"),
-            ],
-        )
-
-    @classmethod
-    def execute(cls, model, image, bboxes=None) -> io.NodeOutput:
-        B, H, W, C = image.shape
-
-        image_in = comfy.utils.common_upscale(image.movedim(-1, 1), 1008, 1008, "bilinear", crop="disabled")
-
-        # Convert bboxes to normalized cxcywh format for the model
+        # Convert bboxes to normalized cxcywh format
         boxes_tensor = None
         if bboxes is not None and len(bboxes) > 0:
-            # bboxes is list[list[dict]] with x, y, width, height
             batch_boxes = []
             for frame_bboxes in bboxes:
                 frame_tensors = []
@@ -158,25 +71,97 @@ class SAM3_Segment(io.ComfyNode):
                 if frame_tensors:
                     batch_boxes.append(torch.tensor(frame_tensors, dtype=torch.float32))
             if batch_boxes:
-                boxes_tensor = torch.stack(batch_boxes).to(image_in.device)
+                boxes_tensor = torch.stack(batch_boxes)
+
+        # Parse point prompts from JSON (KJNodes PointsEditor format: [{"x": int, "y": int}, ...])
+        pos_pts = json.loads(positive_coords) if positive_coords else []
+        neg_pts = json.loads(negative_coords) if negative_coords else []
+        has_points = len(pos_pts) > 0 or len(neg_pts) > 0
 
         comfy.model_management.load_model_gpu(model)
         device = comfy.model_management.get_torch_device()
         dtype = model.model.get_dtype()
-        image_in = image_in.to(device=device, dtype=dtype)
-        if boxes_tensor is not None:
-            boxes_tensor = boxes_tensor.to(device=device, dtype=dtype)
-        results = model.model.diffusion_model(
-            image_in,
-            boxes=boxes_tensor,
-            orig_size=(H, W),
-        )
+        sam3_model = model.model.diffusion_model
 
-        masks = results["masks"]
-        mask_out = masks[:, 0]
-        mask_out = (mask_out > 0).float()
+        if has_points:
+            # Point prompts: use SAM interactive decoder (tracker path), per-image
+            all_coords = [[p["x"] / W * 1008, p["y"] / H * 1008] for p in pos_pts] + \
+                         [[p["x"] / W * 1008, p["y"] / H * 1008] for p in neg_pts]
+            all_labels = [1] * len(pos_pts) + [0] * len(neg_pts)
+            point_inputs = {
+                "point_coords": torch.tensor([all_coords], dtype=dtype, device=device),
+                "point_labels": torch.tensor([all_labels], dtype=torch.int32, device=device),
+            }
+            all_masks = []
+            for b in range(B):
+                frame = image_in[b:b+1].to(device=device, dtype=dtype)
+                mask_logits = sam3_model.forward_segment(frame, point_inputs=point_inputs)
+                mask = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
+                all_masks.append((mask[:, 0] > 0).float())
+            mask_out = torch.cat(all_masks, dim=0)
+            return io.NodeOutput([[] for _ in range(B)], mask_out)
 
-        return io.NodeOutput(mask_out)
+        # Text / box detection: run per-image to avoid OOM
+        if text_embeddings is not None:
+            text_embeddings = text_embeddings.to(device=device, dtype=dtype)
+        if text_mask is not None:
+            text_mask = text_mask.to(device)
+
+        has_text = conditioning is not None and len(conditioning) > 0
+        all_bbox_dicts = []
+        all_masks = []
+
+        for b in range(B):
+            frame = image_in[b:b+1].to(device=device, dtype=dtype)
+            b_boxes_tensor = None
+            if boxes_tensor is not None:
+                b_boxes_tensor = boxes_tensor[b:b+1].to(device=device, dtype=dtype)
+
+            results = sam3_model(
+                frame,
+                text_embeddings=text_embeddings,
+                text_mask=text_mask,
+                boxes=b_boxes_tensor,
+                threshold=threshold,
+                orig_size=(H, W),
+            )
+
+            pred_boxes = results["boxes"][0]  # (Q, 4) xyxy
+            frame_scores = results["scores"][0]  # (Q,)
+            frame_masks = results["masks"][0]  # (Q, H, W)
+
+            if has_text:
+                keep = frame_scores > threshold
+                b_boxes = pred_boxes[keep].cpu()
+                b_scores = frame_scores[keep].cpu()
+                b_masks = frame_masks[keep]
+
+                order = b_scores.argsort(descending=True)[:max_detections]
+                b_boxes = b_boxes[order]
+                b_scores = b_scores[order]
+                b_masks = b_masks[order]
+
+                bbox_dicts = [
+                    {
+                        "x": float(box[0]),
+                        "y": float(box[1]),
+                        "width": float(box[2] - box[0]),
+                        "height": float(box[3] - box[1]),
+                        "score": float(score),
+                    }
+                    for box, score in zip(b_boxes, b_scores)
+                ]
+                all_bbox_dicts.append(bbox_dicts)
+                if b_masks.shape[0] > 0:
+                    all_masks.append((b_masks[0] > 0).float())
+                else:
+                    all_masks.append(torch.zeros(H, W, device=comfy.model_management.intermediate_device()))
+            else:
+                all_bbox_dicts.append([])
+                all_masks.append((frame_masks[0] > 0).float())
+
+        mask_out = torch.stack(all_masks)
+        return io.NodeOutput(all_bbox_dicts, mask_out)
 
 
 class SAM3_VideoTrack(io.ComfyNode):
@@ -192,7 +177,7 @@ class SAM3_VideoTrack(io.ComfyNode):
             inputs=[
                 io.Image.Input("images", display_name="images", tooltip="Video frames as batched images"),
                 io.Model.Input("model", display_name="model"),
-                io.Mask.Input("initial_mask", display_name="initial_mask", tooltip="Mask for the first frame to track"),
+                io.Mask.Input("initial_mask", display_name="initial_mask", tooltip="Mask(s) for the first frame to track (one per object)"),
             ],
             outputs=[
                 io.Mask.Output("masks", display_name="masks"),
@@ -201,7 +186,7 @@ class SAM3_VideoTrack(io.ComfyNode):
 
     @classmethod
     def execute(cls, images, model, initial_mask) -> io.NodeOutput:
-        N, H, W, C = images.shape  # N = number of frames
+        N, H, W, C = images.shape
 
         comfy.model_management.load_model_gpu(model)
         device = comfy.model_management.get_torch_device()
@@ -214,10 +199,9 @@ class SAM3_VideoTrack(io.ComfyNode):
         init_masks = initial_mask.unsqueeze(1).to(device=device, dtype=dtype)  # [N_obj, 1, H, W]
 
         pbar = comfy.utils.ProgressBar(N)
-        mask_logits = sam3_model.forward_video(images=frames_in, initial_mask=init_masks, pbar=pbar)
+        mask_logits = sam3_model.forward_video(images=frames_in, initial_masks=init_masks, pbar=pbar)
         # mask_logits: [N, N_obj, image_size, image_size]
 
-        # Resize masks back to original resolution and binarize
         N_obj = mask_logits.shape[1]
         mask_out = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
         mask_out = (mask_out > 0).float()  # [N, N_obj, H, W]
@@ -233,7 +217,6 @@ class SAM3Extension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             SAM3_Detect,
-            SAM3_Segment,
             SAM3_VideoTrack,
         ]
 

@@ -12,6 +12,7 @@ from comfy.ops import cast_to_input
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.cascade.common import LayerNorm2d_op
 from comfy.ldm.sam3.sam import MLP, PositionEmbeddingRandom
+from comfy.ldm.sam3.sam import TwoWayTransformer as SAMTwoWayTransformer
 
 NO_OBJ_SCORE = -1024.0
 
@@ -168,8 +169,9 @@ class MemoryTransformer(nn.Module):
 
 
 class TwoWayAttnBlock(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, mlp_dim=2048, downsample_rate=2, device=None, dtype=None, operations=None):
+    def __init__(self, d_model=256, num_heads=8, mlp_dim=2048, downsample_rate=2, skip_first_layer_pe=False, device=None, dtype=None, operations=None):
         super().__init__()
+        self.skip_first_layer_pe = skip_first_layer_pe
         internal_dim = d_model // downsample_rate
 
         self.self_attn = SplitAttn(d_model, num_heads, device=device, dtype=dtype, operations=operations)
@@ -187,9 +189,13 @@ class TwoWayAttnBlock(nn.Module):
 
     def forward(self, queries, keys, query_pe, key_pe):
         # Self-attention on queries
-        q = queries + query_pe
-        attn_out = self.self_attn(q)
-        queries = self.norm1(queries + attn_out)
+        if self.skip_first_layer_pe:
+            queries = self.self_attn(queries)
+        else:
+            q = queries + query_pe
+            attn_out = self.self_attn(q, q, queries)
+            queries = queries + attn_out
+        queries = self.norm1(queries)
 
         # Cross-attention: tokens -> image
         q = queries + query_pe
@@ -214,8 +220,9 @@ class TwoWayTransformer(nn.Module):
     def __init__(self, d_model=256, num_heads=8, depth=2, mlp_dim=2048, downsample_rate=2,  device=None, dtype=None, operations=None):
         super().__init__()
         self.layers = nn.ModuleList([
-            TwoWayAttnBlock(d_model, num_heads, mlp_dim, downsample_rate, device=device, dtype=dtype, operations=operations)
-            for _ in range(depth)
+            TwoWayAttnBlock(d_model, num_heads, mlp_dim, downsample_rate,
+                            skip_first_layer_pe=(i == 0), device=device, dtype=dtype, operations=operations)
+            for i in range(depth)
         ])
         self.final_attn_token_to_image = SplitAttn(
             d_model, num_heads, internal_dim=d_model // downsample_rate, device=device, dtype=dtype, operations=operations)
@@ -238,7 +245,7 @@ class SAMMaskDecoder(nn.Module):
         super().__init__()
         self.num_mask_tokens = num_multimask_outputs + 1
 
-        self.transformer = TwoWayTransformer(d_model, num_heads=8, depth=2, mlp_dim=2048, device=device, dtype=dtype, operations=operations)
+        self.transformer = SAMTwoWayTransformer(depth=2, embedding_dim=d_model, num_heads=8, mlp_dim=2048, device=device, dtype=dtype, operations=operations)
 
         self.iou_token = operations.Embedding(1, d_model, device=device, dtype=dtype)
         self.mask_tokens = operations.Embedding(self.num_mask_tokens, d_model, device=device, dtype=dtype)
@@ -267,9 +274,10 @@ class SAMMaskDecoder(nn.Module):
     def forward(self, image_embeddings, image_pe, sparse_prompt_embeddings, dense_prompt_embeddings,
                 high_res_features=None, multimask_output=False, return_all=False):
         B = sparse_prompt_embeddings.shape[0]
-        tokens = torch.cat([cast_to_input(self.iou_token.weight, image_embeddings),
-                            cast_to_input(self.mask_tokens.weight, image_embeddings),
-                            cast_to_input(self.obj_score_token.weight, image_embeddings)], dim=0)
+        # Token order: [obj_score(1), iou(1), mask(num_mask_tokens)]
+        tokens = torch.cat([cast_to_input(self.obj_score_token.weight, image_embeddings),
+                            cast_to_input(self.iou_token.weight, image_embeddings),
+                            cast_to_input(self.mask_tokens.weight, image_embeddings)], dim=0)
         tokens = torch.cat([tokens.unsqueeze(0).expand(B, -1, -1), sparse_prompt_embeddings], dim=1)
 
         src = image_embeddings
@@ -284,20 +292,20 @@ class SAMMaskDecoder(nn.Module):
 
         hs, src_out = self.transformer(src_flat, pos_flat, tokens)
 
-        iou_token_out = hs[:, 0, :]
-        mask_tokens_out = hs[:, 1:1 + self.num_mask_tokens, :]
-        obj_score_token_out = hs[:, 1 + self.num_mask_tokens, :]
+        obj_score_token_out = hs[:, 0, :]
+        iou_token_out = hs[:, 1, :]
+        mask_tokens_out = hs[:, 2:2 + self.num_mask_tokens, :]
 
         src_out = src_out.permute(0, 2, 1).view(b, c, h, w)
-        # Upscale in two stages, inserting high-res features at matching channel dims
+        # Upscale with high-res features projected and added before activation (matching reference)
         dc1, ln1, act1, dc2, act2 = self.output_upscaling
-        upscaled = act1(ln1(dc1(src_out)))
         if high_res_features is not None:
-            upscaled = upscaled + F.interpolate(self.conv_s1(high_res_features[1]), size=upscaled.shape[-2:], mode="bilinear", align_corners=False)
-            upscaled = act2(dc2(upscaled))
-            upscaled = upscaled + F.interpolate(self.conv_s0(high_res_features[0]), size=upscaled.shape[-2:], mode="bilinear", align_corners=False)
+            feat_s0 = self.conv_s0(high_res_features[0])  # [B, d_model//8, 4H, 4W]
+            feat_s1 = self.conv_s1(high_res_features[1])  # [B, d_model//4, 2H, 2W]
+            upscaled = act1(ln1(dc1(src_out) + feat_s1))
+            upscaled = act2(dc2(upscaled) + feat_s0)
         else:
-            upscaled = act2(dc2(upscaled))
+            upscaled = act2(dc2(act1(ln1(dc1(src_out)))))
 
         hyper_in = torch.stack([
             mlp(mask_tokens_out[:, i, :]) for i, mlp in enumerate(self.output_hypernetworks_mlps)
@@ -355,9 +363,15 @@ class SAMPromptEncoder(nn.Module):
         if points is not None:
             coords, labels = points
             B = coords.shape[0]
+            # Pad with an extra point (label=-1) when no boxes are provided (matching reference)
+            if boxes is None:
+                coords = torch.cat([coords, torch.zeros(B, 1, 2, device=coords.device, dtype=coords.dtype)], dim=1)
+                labels = torch.cat([labels, -torch.ones(B, 1, device=labels.device, dtype=labels.dtype)], dim=1)
             pe = self.pe_layer.forward_with_coords(coords + 0.5, self.input_image_size)
             pe[labels == 0] += cast_to_input(self.point_embeddings[0].weight, ref)
             pe[labels == 1] += cast_to_input(self.point_embeddings[1].weight, ref)
+            pe[labels == 2] += cast_to_input(self.point_embeddings[2].weight, ref)
+            pe[labels == 3] += cast_to_input(self.point_embeddings[3].weight, ref)
             invalid = (labels == -1)
             pe[invalid] = 0.0
             pe[invalid] += cast_to_input(self.not_a_point_embed.weight, ref)
@@ -627,7 +641,7 @@ class MultiplexMaskDecoder(nn.Module):
         self.num_mask_output_per_object = num_multimask_outputs  # 3 (multimask_outputs_only)
         total_mask_tokens = num_multiplex * self.num_mask_output_per_object  # 48
 
-        self.transformer = TwoWayTransformer(d_model, num_heads=8, depth=2, mlp_dim=2048, device=device, dtype=dtype, operations=operations)
+        self.transformer = SAMTwoWayTransformer(depth=2, embedding_dim=d_model, num_heads=8, mlp_dim=2048, device=device, dtype=dtype, operations=operations)
 
         self.obj_score_token = operations.Embedding(num_multiplex, d_model, device=device, dtype=dtype)
         self.iou_token = operations.Embedding(num_multiplex, d_model, device=device, dtype=dtype)
@@ -1013,19 +1027,20 @@ class SAM3Tracker(nn.Module):
                 output_dict=output_dict,
                 num_frames=num_frames,
             )
+            # Use multimask for point prompts on init frames (picks best of 3 candidates)
+            num_pts = 0 if point_inputs is None else point_inputs["point_labels"].size(1)
+            multimask_output = is_init_cond_frame and 0 < num_pts <= 1
             sam_outputs = self._forward_sam_heads(
                 backbone_features=pix_feat_with_mem,
                 point_inputs=point_inputs,
                 high_res_features=high_res_features,
-                multimask_output=False,
+                multimask_output=multimask_output,
             )
 
         (low_res_masks, high_res_masks, obj_ptr, object_score_logits) = sam_outputs
 
         # Clean low-res masks: remove sprinkles and fill holes
-        # Remove corner artifacts (up to ~200px at 288x288) while preserving main object
         low_res_masks = fill_holes_in_mask_scores(low_res_masks, max_area=200)
-        # Re-derive high-res from cleaned low-res
         high_res_masks = F.interpolate(low_res_masks, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
 
         current_out["pred_masks"] = low_res_masks
@@ -1372,9 +1387,11 @@ class SAM31Tracker(nn.Module):
                 current_vision_feats=current_vision_feats, current_vision_pos_embeds=current_vision_pos_embeds,
                 feat_sizes=feat_sizes, output_dict=output_dict, num_frames=num_frames,
             )
+            num_pts = 0 if point_inputs is None else point_inputs["point_labels"].size(1)
+            multimask_output = is_init_cond_frame and 0 < num_pts <= 1
             sam_outputs = self._forward_sam_heads(
                 backbone_features=pix_feat_with_mem, point_inputs=point_inputs,
-                high_res_features=high_res_features, multimask_output=False,
+                high_res_features=high_res_features, multimask_output=multimask_output,
             )
 
         (low_res_masks, high_res_masks, obj_ptr, object_score_logits) = sam_outputs

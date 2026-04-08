@@ -1779,6 +1779,13 @@ class SAM3(supported_models_base.BASE):
             state_dict[base + ".q_proj" + s] = t[:d]
             state_dict[base + ".k_proj" + s] = t[d:2*d]
             state_dict[base + ".v_proj" + s] = t[2*d:]
+        # Remap tracker SAM decoder transformer key names to match sam.py TwoWayTransformer
+        for k in list(state_dict.keys()):
+            if "sam_mask_decoder.transformer." not in k:
+                continue
+            new_k = k.replace(".mlp.lin1.", ".mlp.0.").replace(".mlp.lin2.", ".mlp.2.").replace(".norm_final_attn.", ".norm_final.")
+            if new_k != k:
+                state_dict[new_k] = state_dict.pop(k)
         return state_dict
 
     def get_model(self, state_dict, prefix="", device=None):

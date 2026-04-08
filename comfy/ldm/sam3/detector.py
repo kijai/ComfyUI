@@ -49,6 +49,8 @@ class SplitMHA(nn.Module):
         else:
             k = self.k_proj(k_input)
             v = self.v_proj(v_input if v_input is not None else k_input)
+        if mask is not None and mask.ndim == 2:
+            mask = mask[:, None, None, :]  # [B, T] -> [B, 1, 1, T] for SDPA broadcast
         dtype = q.dtype  # manual_cast may produce mixed dtypes
         out = optimized_attention(q, k.to(dtype), v.to(dtype), self.num_heads, mask=mask)
         return self.out_proj(out)
@@ -416,6 +418,10 @@ class SAM3Detector(nn.Module):
             for layer in geo_enc.encode:
                 geo_cls = self._run_geo_layer(layer, geo_cls, img_flat, pos_flat)
             geo_cls = geo_enc.encode_norm(geo_cls)
+            if text_embeddings is not None and text_embeddings.shape[0] != B:
+                text_embeddings = text_embeddings.expand(B, -1, -1)
+            if text_mask is not None and text_mask.shape[0] != B:
+                text_mask = text_mask.expand(B, -1)
             parts = [t for t in [text_embeddings, geo_prompts, geo_cls] if t is not None]
             text_embeddings = torch.cat(parts, dim=1)
             n_new = text_embeddings.shape[1] - (text_mask.shape[1] if text_mask is not None else 0)
@@ -459,6 +465,45 @@ class SAM3Model(nn.Module):
 
     def forward(self, images, **kwargs):
         return self.detector(images, **kwargs)
+
+    def forward_segment(self, images, point_inputs=None):
+        """Interactive segmentation using SAM decoder with point prompts.
+
+        Args:
+            images: [B, 3, 1008, 1008] preprocessed images
+            point_inputs: {"point_coords": [B, N, 2], "point_labels": [B, N]} in 1008x1008 pixel space
+        Returns:
+            [B, 1, image_size, image_size] high-res mask logits
+        """
+        bb = self.detector.backbone["vision_backbone"]
+        if bb.multiplex:
+            _, _, tracker_features, tracker_positions = bb(images, tracker_mode="interactive")
+        else:
+            _, _, tracker_features, tracker_positions = bb(images, need_tracker=True)
+            if self.detector.scalp > 0:
+                tracker_features = tracker_features[:-self.detector.scalp]
+                tracker_positions = tracker_positions[:-self.detector.scalp]
+
+        high_res = [f for f in tracker_features[:-1]]
+        backbone_feat = tracker_features[-1]
+        B, C, H, W = backbone_feat.shape
+        # Add no-memory embedding (init frame path)
+        no_mem = getattr(self.tracker, 'interactivity_no_mem_embed', None)
+        if no_mem is None:
+            no_mem = getattr(self.tracker, 'no_mem_embed', None)
+        if no_mem is not None:
+            feat_flat = backbone_feat.flatten(2).permute(0, 2, 1)
+            feat_flat = feat_flat + cast_to_input(no_mem, feat_flat)
+            backbone_feat = feat_flat.view(B, H, W, C).permute(0, 3, 1, 2)
+
+        num_pts = 0 if point_inputs is None else point_inputs["point_labels"].size(1)
+        _, high_res_masks, _, _ = self.tracker._forward_sam_heads(
+            backbone_features=backbone_feat,
+            point_inputs=point_inputs,
+            high_res_features=high_res,
+            multimask_output=(0 < num_pts <= 1),
+        )
+        return high_res_masks
 
     def forward_video(self, images, initial_masks, pbar=None):
         cached = getattr(self.detector, '_cached_tracker_features', None)
