@@ -556,12 +556,19 @@ class VAE:
                         old_memory_used_decode = self.memory_used_decode
                         self.memory_used_decode = lambda shape, dtype: old_memory_used_decode(shape, dtype) *  4.0
 
+                    decoder_ch = sd['decoder.conv_in.weight'].shape[0] // ddconfig['ch_mult'][-1]
+                    if decoder_ch != ddconfig['ch']:
+                        decoder_ddconfig = ddconfig.copy()
+                        decoder_ddconfig['ch'] = decoder_ch
+                    else:
+                        decoder_ddconfig = None
+
                     if 'post_quant_conv.weight' in sd:
-                        self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1])
+                        self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1], **({"decoder_ddconfig": decoder_ddconfig} if decoder_ddconfig is not None else {}))
                     else:
                         self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                                                     encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': ddconfig},
-                                                                    decoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Decoder", 'params': ddconfig})
+                                                                    decoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Decoder", 'params': decoder_ddconfig if decoder_ddconfig is not None else ddconfig})
             elif "decoder.layers.1.layers.0.beta" in sd:
                 config = {}
                 param_key = None
@@ -1745,6 +1752,8 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
     if len(temp_sd) > 0:
         sd = temp_sd
+        if custom_operations is None:
+            sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
 
     parameters = comfy.utils.calculate_parameters(sd)
     weight_dtype = comfy.utils.weight_dtype(sd)
