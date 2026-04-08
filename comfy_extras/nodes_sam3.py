@@ -210,17 +210,20 @@ class SAM3_VideoTrack(io.ComfyNode):
 
         frames = images.movedim(-1, 1)
         frames_in = comfy.utils.common_upscale(frames, 1008, 1008, "bilinear", crop="disabled").to(device=device, dtype=dtype)
-        init_mask = initial_mask[0:1].unsqueeze(0).to(device=device, dtype=dtype)
+        # initial_mask: [N_obj, H, W] — one mask per object to track
+        init_masks = initial_mask.unsqueeze(1).to(device=device, dtype=dtype)  # [N_obj, 1, H, W]
 
         pbar = comfy.utils.ProgressBar(N)
-        mask_logits = sam3_model.forward_video(images=frames_in, initial_mask=init_mask, pbar=pbar)
+        mask_logits = sam3_model.forward_video(images=frames_in, initial_mask=init_masks, pbar=pbar)
+        # mask_logits: [N, N_obj, image_size, image_size]
 
         # Resize masks back to original resolution and binarize
-        mask_out = F.interpolate(
-            mask_logits, size=(H, W),
-            mode="bilinear", align_corners=False,
-        )
-        mask_out = (mask_out[:, 0] > 0).float()  # [N, H, W]
+        N_obj = mask_logits.shape[1]
+        mask_out = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
+        mask_out = (mask_out > 0).float()  # [N, N_obj, H, W]
+
+        # Flatten to [N * N_obj, H, W] batch of masks
+        mask_out = mask_out.view(N * N_obj, H, W)
 
         return io.NodeOutput(mask_out)
 

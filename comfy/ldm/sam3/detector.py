@@ -460,7 +460,7 @@ class SAM3Model(nn.Module):
     def forward(self, images, **kwargs):
         return self.detector(images, **kwargs)
 
-    def forward_video(self, images, initial_mask, pbar=None):
+    def forward_video(self, images, initial_masks, pbar=None):
         cached = getattr(self.detector, '_cached_tracker_features', None)
         self.detector._cached_tracker_features = None
         def backbone_fn(frame):
@@ -471,4 +471,4 @@ class SAM3Model(nn.Module):
                 return out
             _, _, tf, tp = self.detector._get_backbone_features(frame)
             return tf, tp
-        return self.tracker.track_video(backbone_fn, images, initial_mask, pbar=pbar)
+        return self.tracker.track_video(backbone_fn, images, initial_masks, pbar=pbar)

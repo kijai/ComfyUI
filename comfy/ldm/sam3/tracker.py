@@ -1050,75 +1050,71 @@ class SAM3Tracker(nn.Module):
 
         return current_out
 
-    def track_video(self, backbone_fn, images, initial_mask, pbar=None):
-        """Track objects across video frames.
-
-        Args:
-            backbone_fn: callable that returns (sam2_features, sam2_positions) for a frame
-            images: [N, 3, 1008, 1008] video frames
-            initial_mask: [1, 1, H, W] binary mask for first frame
-            pbar: optional progress bar
-
-        Returns:
-            all_masks: [N, 1, image_size, image_size] predicted masks per frame
-        """
-        N = images.shape[0]
-        device = images.device
-
-        output_dict = {
-            "cond_frame_outputs": {},
-            "non_cond_frame_outputs": {},
-        }
-        all_masks = []
-
-        for frame_idx in range(N):
-            frame = images[frame_idx:frame_idx + 1]
-
-            # Get tracker backbone features (sam2 neck)
-            sam2_features, sam2_positions = backbone_fn(frame)
-
-            # Use last 3 levels (drop 0.5x)
+    def _precompute_backbone(self, backbone_fn, images):
+        """Pre-compute and cache backbone features for all frames."""
+        cached = []
+        for frame_idx in range(images.shape[0]):
+            sam2_features, sam2_positions = backbone_fn(images[frame_idx:frame_idx + 1])
             backbone_fpn = sam2_features[:-1]
             vision_pos_enc = sam2_positions[:-1]
-
-            # Flatten to [B, HW, C]
             feat_sizes = [(x.shape[-2], x.shape[-1]) for x in backbone_fpn]
             vision_feats = [x.flatten(2).permute(0, 2, 1) for x in backbone_fpn]
             vision_pos = [x.flatten(2).permute(0, 2, 1) for x in vision_pos_enc]
+            cached.append((vision_feats, vision_pos, feat_sizes))
+        return cached
 
-            is_init = (frame_idx == 0)
+    def _track_single_object(self, cached_features, images, initial_mask, pbar=None):
+        """Track one object using pre-computed backbone features."""
+        N = len(cached_features)
+        device, dt = images.device, images.dtype
+        output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
+        all_masks = []
+
+        for frame_idx in range(N):
+            vision_feats, vision_pos, feat_sizes = cached_features[frame_idx]
             mask_input = None
-            if is_init:
-                # Resize initial mask to image_size
-                mask_input = F.interpolate(
-                    initial_mask.to(device=device, dtype=images.dtype),
-                    size=(self.image_size, self.image_size),
-                    mode="bilinear", align_corners=False,
-                )
-                mask_input = (mask_input > 0.5).to(images.dtype)
+            if frame_idx == 0:
+                mask_input = F.interpolate(initial_mask.to(device=device, dtype=dt),
+                    size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+                mask_input = (mask_input > 0.5).to(dt)
 
             current_out = self.track_step(
-                frame_idx=frame_idx,
-                is_init_cond_frame=is_init,
-                current_vision_feats=vision_feats,
-                current_vision_pos_embeds=vision_pos,
-                feat_sizes=feat_sizes,
-                mask_inputs=mask_input,
-                output_dict=output_dict,
-                num_frames=N,
-            )
+                frame_idx=frame_idx, is_init_cond_frame=(frame_idx == 0),
+                current_vision_feats=vision_feats, current_vision_pos_embeds=vision_pos,
+                feat_sizes=feat_sizes, mask_inputs=mask_input, output_dict=output_dict, num_frames=N)
 
-            if is_init:
+            if frame_idx == 0:
                 output_dict["cond_frame_outputs"][frame_idx] = current_out
             else:
                 output_dict["non_cond_frame_outputs"][frame_idx] = current_out
-
             all_masks.append(current_out["pred_masks_high_res"])
-
             if pbar is not None:
                 pbar.update(1)
 
         return torch.cat(all_masks, dim=0)  # [N, 1, H, W]
+
+    def track_video(self, backbone_fn, images, initial_masks, pbar=None):
+        """Track one or more objects across video frames.
+
+        Args:
+            backbone_fn: callable that returns (sam2_features, sam2_positions) for a frame
+            images: [N, 3, 1008, 1008] video frames
+            initial_masks: [N_obj, 1, H, W] binary masks for first frame (one per object)
+            pbar: optional progress bar
+
+        Returns:
+            [N, N_obj, image_size, image_size] predicted mask logits per frame per object
+        """
+        cached = self._precompute_backbone(backbone_fn, images)
+
+        N_obj = initial_masks.shape[0]
+        per_object = []
+        for obj_idx in range(N_obj):
+            obj_masks = self._track_single_object(
+                cached, images, initial_masks[obj_idx:obj_idx + 1], pbar=pbar)
+            per_object.append(obj_masks)
+
+        return torch.cat(per_object, dim=1)  # [N, N_obj, H, W]
 
 
 class SAM31Tracker(nn.Module):
@@ -1171,9 +1167,6 @@ class SAM31Tracker(nn.Module):
 
         # Position encoding for image (used by multiplex decoder)
         self.image_pe_layer = PositionEmbeddingRandom(d_model // 2)
-
-    def _get_image_pe(self, size):
-        return self.image_pe_layer(size)
 
     def _get_tpos_enc(self, rel_pos_list, device, max_abs_pos=None):
         pos_enc = torch.tensor(rel_pos_list, dtype=torch.float32, device=device) / max((max_abs_pos or 2) - 1, 1)
@@ -1239,69 +1232,6 @@ class SAM31Tracker(nn.Module):
         obj_ptr = torch.lerp(no_obj, obj_ptr, alpha)
 
         return low_res_masks, high_res_masks, obj_ptr, object_score_logits
-
-    def _forward_multiplex_sam_heads(self, backbone_features, high_res_features=None, multimask_output=False):
-        """Forward multiplex SAM decoder (16 objects, for propagation/tracking)."""
-        B = backbone_features.shape[0]
-        device = backbone_features.device
-
-        feat_size = backbone_features.shape[-2:]
-        image_pe = self._get_image_pe(feat_size).to(dtype=backbone_features.dtype)
-
-        # No sparse prompts for propagation — use empty
-        sparse = torch.empty(B, 0, self.d_model, device=device, dtype=backbone_features.dtype)
-        # No dense prompts — use zero
-        dense = torch.zeros(B, self.d_model, *feat_size, device=device, dtype=backbone_features.dtype)
-
-        low_res_multimasks, ious, sam_output_tokens, object_score_logits = \
-            self.sam_mask_decoder(
-                image_embeddings=backbone_features, image_pe=image_pe,
-                sparse_prompt_embeddings=sparse, dense_prompt_embeddings=dense,
-                high_res_features=high_res_features, multimask_output=multimask_output, return_all=True,
-            )
-        # low_res_multimasks: [B, M, T-1 or 1, H, W]
-        # ious: [B, M, T-1 or 1]
-        # object_score_logits: [B, M, 1]
-
-        M = self.num_multiplex
-        is_obj_appearing = object_score_logits.squeeze(-1) > 0  # [B, M]
-
-        # Zero out masks for non-appearing objects
-        low_res_multimasks = torch.where(
-            is_obj_appearing[:, :, None, None, None], low_res_multimasks,
-            torch.tensor(NO_OBJ_SCORE, device=device, dtype=low_res_multimasks.dtype))
-        high_res_multimasks = F.interpolate(
-            low_res_multimasks.flatten(1, 2), size=(self.image_size, self.image_size), mode="bilinear", align_corners=False
-        ).view(B, M, -1, self.image_size, self.image_size)
-
-        # Select best mask per multiplex slot
-        if multimask_output and ious.shape[-1] > 1:
-            best_iou_inds = torch.argmax(ious, dim=-1)  # [B, M]
-            batch_inds = torch.arange(B, device=device).unsqueeze(1).expand(-1, M)
-            mult_inds = torch.arange(M, device=device).unsqueeze(0).expand(B, -1)
-            low_res_masks = low_res_multimasks[batch_inds, mult_inds, best_iou_inds].unsqueeze(2)
-            high_res_masks = high_res_multimasks[batch_inds, mult_inds, best_iou_inds].unsqueeze(2)
-        else:
-            low_res_masks = low_res_multimasks
-            high_res_masks = high_res_multimasks
-
-        # Object pointers from first mask token of each slot
-        sam_output_token = sam_output_tokens[:, :, 0]  # [B, M, C]
-        obj_ptrs = []
-        for i in range(M):
-            ptr = self.obj_ptr_proj(sam_output_token[:, i])
-            no_obj = self.no_obj_ptr_linear(sam_output_token[:, i])
-            alpha_i = is_obj_appearing[:, i:i+1].to(ptr.dtype)
-            obj_ptrs.append(torch.lerp(no_obj, ptr, alpha_i))
-        obj_ptr = torch.stack(obj_ptrs, dim=1)  # [B, M, C]
-        # Average across multiplex slots for a single pointer
-        obj_ptr_mean = obj_ptr.mean(dim=1)  # [B, C]
-
-        # Combine masks: union of all multiplex slots
-        low_res_combined = low_res_masks.squeeze(2).max(dim=1).values.unsqueeze(1)  # [B, 1, H, W]
-        high_res_combined = high_res_masks.squeeze(2).max(dim=1).values.unsqueeze(1)
-
-        return low_res_combined, high_res_combined, obj_ptr_mean, object_score_logits.squeeze(-1).max(dim=1).values.unsqueeze(-1)
 
     def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
         out_scale, out_bias = 20.0, -10.0
@@ -1404,6 +1334,12 @@ class SAM31Tracker(nn.Module):
             mask_for_mem = torch.sigmoid(pred_masks_high_res)
         mask_for_mem.mul_(self.sigmoid_scale_for_mem_enc).add_(self.sigmoid_bias_for_mem_enc)
 
+        # Pad single-channel mask to 32 channels (multiplex backbone expects num_multiplex*2 channels)
+        if mask_for_mem.shape[1] < self.num_multiplex * 2:
+            pad = torch.zeros(mask_for_mem.shape[0], self.num_multiplex * 2 - mask_for_mem.shape[1],
+                              *mask_for_mem.shape[2:], device=mask_for_mem.device, dtype=mask_for_mem.dtype)
+            mask_for_mem = torch.cat([mask_for_mem, pad], dim=1)
+
         maskmem_out = self.maskmem_backbone(pix_feat, mask_for_mem, skip_mask_sigmoid=True)
         maskmem_features = maskmem_out["vision_features"]
         maskmem_pos_enc = maskmem_out["vision_pos_enc"]
@@ -1465,39 +1401,38 @@ class SAM31Tracker(nn.Module):
 
         return current_out
 
-    def track_video(self, backbone_fn, images, initial_mask, pbar=None):
-        N = images.shape[0]
-        device = images.device
+    def _precompute_backbone(self, backbone_fn, images):
+        """Pre-compute and cache backbone features for all frames."""
+        cached = []
+        for frame_idx in range(images.shape[0]):
+            tracker_features, tracker_positions = backbone_fn(images[frame_idx:frame_idx + 1])
+            feat_sizes = [(x.shape[-2], x.shape[-1]) for x in tracker_features]
+            vision_feats = [x.flatten(2).permute(0, 2, 1) for x in tracker_features]
+            vision_pos = [x.flatten(2).permute(0, 2, 1) for x in tracker_positions]
+            cached.append((vision_feats, vision_pos, feat_sizes))
+        return cached
+
+    def _track_single_object(self, cached_features, images, initial_mask, pbar=None):
+        """Track one object using pre-computed backbone features."""
+        N = len(cached_features)
+        device, dt = images.device, images.dtype
         output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
         all_masks = []
 
         for frame_idx in range(N):
-            frame = images[frame_idx:frame_idx + 1]
-            tracker_features, tracker_positions = backbone_fn(frame)
-
-            # SAM3.1 backbone returns 3 levels directly (no drop needed)
-            feat_sizes = [(x.shape[-2], x.shape[-1]) for x in tracker_features]
-            vision_feats = [x.flatten(2).permute(0, 2, 1) for x in tracker_features]
-            vision_pos = [x.flatten(2).permute(0, 2, 1) for x in tracker_positions]
-
-            is_init = (frame_idx == 0)
+            vision_feats, vision_pos, feat_sizes = cached_features[frame_idx]
             mask_input = None
-            if is_init:
-                mask_input = F.interpolate(
-                    initial_mask.to(device=device, dtype=images.dtype),
-                    size=(self.image_size, self.image_size),
-                    mode="bilinear", align_corners=False,
-                )
-                mask_input = (mask_input > 0.5).to(images.dtype)
+            if frame_idx == 0:
+                mask_input = F.interpolate(initial_mask.to(device=device, dtype=dt),
+                    size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+                mask_input = (mask_input > 0.5).to(dt)
 
             current_out = self.track_step(
-                frame_idx=frame_idx, is_init_cond_frame=is_init,
+                frame_idx=frame_idx, is_init_cond_frame=(frame_idx == 0),
                 current_vision_feats=vision_feats, current_vision_pos_embeds=vision_pos,
-                feat_sizes=feat_sizes, mask_inputs=mask_input,
-                output_dict=output_dict, num_frames=N,
-            )
+                feat_sizes=feat_sizes, mask_inputs=mask_input, output_dict=output_dict, num_frames=N)
 
-            if is_init:
+            if frame_idx == 0:
                 output_dict["cond_frame_outputs"][frame_idx] = current_out
             else:
                 output_dict["non_cond_frame_outputs"][frame_idx] = current_out
@@ -1505,4 +1440,27 @@ class SAM31Tracker(nn.Module):
             if pbar is not None:
                 pbar.update(1)
 
-        return torch.cat(all_masks, dim=0)
+        return torch.cat(all_masks, dim=0)  # [N, 1, H, W]
+
+    def track_video(self, backbone_fn, images, initial_masks, pbar=None):
+        """Track one or more objects across video frames.
+
+        Args:
+            backbone_fn: callable that returns (tracker_features, tracker_positions) for a frame
+            images: [N, 3, 1008, 1008] video frames
+            initial_masks: [N_obj, 1, H, W] binary masks for first frame (one per object)
+            pbar: optional progress bar
+
+        Returns:
+            [N, N_obj, image_size, image_size] predicted mask logits per frame per object
+        """
+        cached = self._precompute_backbone(backbone_fn, images)
+
+        N_obj = initial_masks.shape[0]
+        per_object = []
+        for obj_idx in range(N_obj):
+            obj_masks = self._track_single_object(
+                cached, images, initial_masks[obj_idx:obj_idx + 1], pbar=pbar)
+            per_object.append(obj_masks)
+
+        return torch.cat(per_object, dim=1)  # [N, N_obj, H, W]
