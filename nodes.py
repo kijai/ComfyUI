@@ -2453,6 +2453,7 @@ async def init_builtin_extra_nodes():
         "nodes_sdpose.py",
         "nodes_math.py",
         "nodes_painter.py",
+        "nodes_cogvideox.py",
     ]
 
     import_failed = []
