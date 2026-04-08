@@ -7,8 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from comfy.ldm.modules.attention import optimized_attention
-from comfy.ldm.sam3.tracker import SAM3Tracker
-from comfy.ldm.sam3.backbone import SAM3VisionBackbone
+from comfy.ldm.sam3.tracker import SAM3Tracker, SAM31Tracker
+from comfy.ldm.sam3.backbone import SAM3VisionBackbone  # noqa: used in __init__
+
+TRACKER_CLASSES = {"SAM3": SAM3Tracker, "SAM31": SAM31Tracker}
 from comfy.ops import cast_to_input
 
 
@@ -356,16 +358,31 @@ class SAM3Detector(nn.Module):
     def __init__(self, d_model=256, embed_dim=1024, num_queries=200, device=None, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
-        for k in ("num_heads", "num_head_channels", "image_model"):
+        image_model = kwargs.pop("image_model", "SAM3")
+        for k in ("num_heads", "num_head_channels"):
             kwargs.pop(k, None)
+        multiplex = image_model == "SAM31"
+        # SAM3: 4 FPN levels, drop last (scalp=1); SAM3.1: 3 levels, use all (scalp=0)
+        self.scalp = 0 if multiplex else 1
         self.backbone = nn.ModuleDict({
-            "vision_backbone": SAM3VisionBackbone(embed_dim=embed_dim, d_model=d_model, device=device, dtype=dtype, operations=operations, **kwargs),
+            "vision_backbone": SAM3VisionBackbone(embed_dim=embed_dim, d_model=d_model, multiplex=multiplex, device=device, dtype=dtype, operations=operations, **kwargs),
             "language_backbone": nn.ModuleDict({"resizer": operations.Linear(embed_dim, d_model, device=device, dtype=dtype)}),
         })
         self.transformer = Transformer(d_model=d_model, num_queries=num_queries, device=device, dtype=dtype, operations=operations)
         self.segmentation_head = SegmentationHead(d_model=d_model, device=device, dtype=dtype, operations=operations)
         self.geometry_encoder = GeometryEncoder(d_model=d_model, device=device, dtype=dtype, operations=operations)
         self.dot_prod_scoring = DotProductScoring(d_model=d_model, device=device, dtype=dtype, operations=operations)
+
+    def _get_backbone_features(self, images):
+        """Run backbone and return (detector_features, detector_positions, tracker_features, tracker_positions)."""
+        bb = self.backbone["vision_backbone"]
+        if bb.multiplex:
+            all_f, all_p, tf, tp = bb(images, tracker_mode="propagation")
+        else:
+            all_f, all_p, tf, tp = bb(images, need_tracker=True)
+        if self.scalp > 0:
+            all_f, all_p = all_f[:-self.scalp], all_p[:-self.scalp]
+        return all_f, all_p, tf, tp
 
     @staticmethod
     def _run_geo_layer(layer, tgt, memory, memory_pos):
@@ -377,10 +394,8 @@ class SAM3Detector(nn.Module):
 
     def forward(self, images, text_embeddings=None, text_mask=None, points=None, boxes=None, threshold=0.3, orig_size=None):
         B = images.shape[0]
-        all_features, all_positions, sam2_features, sam2_positions = self.backbone["vision_backbone"](images, need_tracker=True)
-        self._cached_tracker_features = (sam2_features, sam2_positions)
-        features = all_features[:-1]  # scalp=1: drop 0.5x level
-        positions = all_positions[:-1]
+        features, positions, tracker_features, tracker_positions = self._get_backbone_features(images)
+        self._cached_tracker_features = (tracker_features, tracker_positions)
 
         if text_embeddings is not None:
             text_embeddings = self.backbone["language_backbone"]["resizer"](text_embeddings)
@@ -437,14 +452,15 @@ class SAM3Model(nn.Module):
     def __init__(self, device=None, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
+        image_model = kwargs.get("image_model", "SAM3")
+        tracker_cls = TRACKER_CLASSES[image_model]
         self.detector = SAM3Detector(device=device, dtype=dtype, operations=operations, **kwargs)
-        self.tracker = SAM3Tracker(device=device, dtype=dtype, operations=operations, **kwargs)
+        self.tracker = tracker_cls(device=device, dtype=dtype, operations=operations, **kwargs)
 
     def forward(self, images, **kwargs):
         return self.detector(images, **kwargs)
 
     def forward_video(self, images, initial_mask, pbar=None):
-        # Reuse tracker features cached from detection on frame 0
         cached = getattr(self.detector, '_cached_tracker_features', None)
         self.detector._cached_tracker_features = None
         def backbone_fn(frame):
@@ -453,6 +469,6 @@ class SAM3Model(nn.Module):
                 out = cached
                 cached = None
                 return out
-            _, _, s2f, s2p = self.detector.backbone["vision_backbone"](frame, need_tracker=True)
-            return s2f, s2p
+            _, _, tf, tp = self.detector._get_backbone_features(frame)
+            return tf, tp
         return self.tracker.track_video(backbone_fn, images, initial_mask, pbar=pbar)

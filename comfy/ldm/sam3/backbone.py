@@ -263,27 +263,42 @@ class PositionEmbeddingSine(nn.Module):
 
 
 class SAM3VisionBackbone(nn.Module):
-    def __init__(self, embed_dim=1024, d_model=256, device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, embed_dim=1024, d_model=256, multiplex=False, device=None, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.trunk = ViTDet(embed_dim=embed_dim, device=device, dtype=dtype, operations=operations, **kwargs)
         self.position_encoding = PositionEmbeddingSine(num_pos_feats=d_model, normalize=True)
+        self.multiplex = multiplex
 
-        scales = [4.0, 2.0, 1.0, 0.5]
-        self.convs = nn.ModuleList([
-            FPNScaleConv(embed_dim, d_model, s, device=device, dtype=dtype, operations=operations) for s in scales
-        ])
-        # SAM2 neck (dual neck for tracker)
-        self.sam2_convs = nn.ModuleList([
-            FPNScaleConv(embed_dim, d_model, s, device=device, dtype=dtype, operations=operations) for s in scales
-        ])
+        fpn_args = dict(device=device, dtype=dtype, operations=operations)
+        if multiplex:
+            # SAM3.1: 3 FPN necks, 3 levels each (4x, 2x, 1x)
+            scales = [4.0, 2.0, 1.0]
+            self.convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.propagation_convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.interactive_convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
+        else:
+            # SAM3: 2 FPN necks, 4 levels each (4x, 2x, 1x, 0.5x)
+            scales = [4.0, 2.0, 1.0, 0.5]
+            self.convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.sam2_convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
 
-    def forward(self, images, need_tracker=False):
+    def forward(self, images, need_tracker=False, tracker_mode=None):
         backbone_out = self.trunk(images)
         features = [conv(backbone_out) for conv in self.convs]
         positions = [self.position_encoding(f).to(dtype=f.dtype) for f in features]
-        if need_tracker:
-            sam2_features = [conv(backbone_out) for conv in self.sam2_convs]
-            sam2_positions = [self.position_encoding(f).to(dtype=f.dtype) for f in sam2_features]
+
+        if self.multiplex:
+            if tracker_mode == "propagation":
+                tracker_convs = self.propagation_convs
+            elif tracker_mode == "interactive":
+                tracker_convs = self.interactive_convs
+            else:
+                return features, positions, None, None
+        elif need_tracker:
+            tracker_convs = self.sam2_convs
         else:
-            sam2_features = sam2_positions = None
-        return features, positions, sam2_features, sam2_positions
+            return features, positions, None, None
+
+        tracker_features = [conv(backbone_out) for conv in tracker_convs]
+        tracker_positions = [self.position_encoding(f).to(dtype=f.dtype) for f in tracker_features]
+        return features, positions, tracker_features, tracker_positions
