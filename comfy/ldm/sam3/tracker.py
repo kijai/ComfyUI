@@ -133,6 +133,42 @@ def get_1d_sine_pe(pos_inds, dim, temperature=10000):
     return torch.cat([pos_embed.sin(), pos_embed.cos()], dim=-1)
 
 
+def collect_memory_tokens(output_dict, frame_idx, num_maskmem, maskmem_tpos_enc, device, collect_image_feats=False):
+    """Collect spatial memory, position encodings, and optionally image features from past frames."""
+    to_cat_memory, to_cat_memory_pos = [], []
+    to_cat_image_feat, to_cat_image_pos = [], []
+
+    cond_outputs = output_dict["cond_frame_outputs"]
+    for _, out in cond_outputs.items():
+        feats = out["maskmem_features"].to(device)
+        to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
+        maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
+        tpos_enc = cast_to_input(maskmem_tpos_enc[num_maskmem - 1], maskmem_enc)
+        maskmem_enc = maskmem_enc + tpos_enc
+        to_cat_memory_pos.append(maskmem_enc)
+        if collect_image_feats and "image_features" in out:
+            to_cat_image_feat.append(out["image_features"].to(device))
+            to_cat_image_pos.append(out["image_pos_enc"].to(device) + tpos_enc)
+
+    for t_pos in range(1, num_maskmem):
+        t_rel = num_maskmem - t_pos
+        prev_frame_idx = frame_idx - t_rel
+        out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+        if out is None or out.get("maskmem_features") is None:
+            continue
+        feats = out["maskmem_features"].to(device)
+        to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
+        maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
+        tpos_enc = cast_to_input(maskmem_tpos_enc[num_maskmem - t_pos - 1], maskmem_enc)
+        maskmem_enc = maskmem_enc + tpos_enc
+        to_cat_memory_pos.append(maskmem_enc)
+        if collect_image_feats and "image_features" in out:
+            to_cat_image_feat.append(out["image_features"].to(device))
+            to_cat_image_pos.append(out["image_pos_enc"].to(device) + tpos_enc)
+
+    return to_cat_memory, to_cat_memory_pos, to_cat_image_feat, to_cat_image_pos, cond_outputs
+
+
 def compute_tpos_enc(rel_pos_list, device, d_model, proj_layer, dtype=None, max_abs_pos=None):
     """Temporal position encoding for object pointers."""
     pos_enc = torch.tensor(rel_pos_list, dtype=torch.float32, device=device) / max((max_abs_pos or 2) - 1, 1)
@@ -145,8 +181,14 @@ def compute_tpos_enc(rel_pos_list, device, d_model, proj_layer, dtype=None, max_
 def forward_sam_heads(backbone_features, prompt_encoder, mask_decoder, obj_ptr_proj, no_obj_fn,
                       image_size, point_inputs=None, mask_inputs=None, high_res_features=None, multimask_output=False):
     """Shared SAM prompt encoder + mask decoder forward for both SAM3 and SAM3.1 trackers."""
-    B = backbone_features.shape[0]
     device = backbone_features.device
+    # Batch size from inputs (mask_inputs may have N_obj > 1 while backbone is batch 1)
+    if mask_inputs is not None:
+        B = mask_inputs.shape[0]
+    elif point_inputs is not None:
+        B = point_inputs["point_coords"].shape[0]
+    else:
+        B = backbone_features.shape[0]
 
     if point_inputs is not None:
         sam_point_coords = point_inputs["point_coords"]
@@ -192,7 +234,7 @@ def forward_sam_heads(backbone_features, prompt_encoder, mask_decoder, obj_ptr_p
         low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
     obj_ptr = obj_ptr_proj(sam_output_token)
-    obj_ptr = no_obj_fn(obj_ptr, sam_output_token, is_obj_appearing)
+    obj_ptr = no_obj_fn(obj_ptr, is_obj_appearing)
 
     return low_res_masks, high_res_masks, obj_ptr, object_score_logits
 
@@ -253,21 +295,13 @@ class MemoryAttnLayer(nn.Module):
         self.norm2 = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.norm3 = operations.LayerNorm(d_model, device=device, dtype=dtype)
 
-    def forward(self, src, memory, memory_pos=None, rope=None, num_k_exclude_rope=0):
-        # Pre-norm self-attention (with RoPE)
-        src2 = self.norm1(src)
-        src2 = self.self_attn(src2, rope=rope)
-        src = src + src2
-        # Pre-norm cross-attention to memory (with RoPE + additive pos on keys)
-        src2 = self.norm2(src)
+    def forward(self, x, memory, memory_pos=None, rope=None, num_k_exclude_rope=0):
+        x = x + self.self_attn(self.norm1(x), rope=rope)
         mem_k = memory + memory_pos if memory_pos is not None else memory
-        src2 = self.cross_attn_image(src2, mem_k, memory, rope=rope, num_k_exclude_rope=num_k_exclude_rope)
-        src = src + src2
-        # Pre-norm FFN
-        src2 = self.norm3(src)
-        src2 = self.linear2(F.relu(self.linear1(src2)))
-        src = src + src2
-        return src
+        x = x + self.cross_attn_image(self.norm2(x), mem_k, memory, rope=rope, num_k_exclude_rope=num_k_exclude_rope)
+        normed = self.norm3(x)
+        x = x + self.linear2(F.relu(self.linear1(normed)))
+        return x
 
 
 class MemoryAttnEncoder(nn.Module):
@@ -279,20 +313,19 @@ class MemoryAttnEncoder(nn.Module):
         ])
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
 
-    def forward(self, src, memory, src_pos=None, memory_pos=None, num_k_exclude_rope=0):
-        # pos_enc_at_input: add 0.1 * position encoding
+    def forward(self, x, memory, src_pos=None, memory_pos=None, num_k_exclude_rope=0):
         if src_pos is not None:
-            src = src + 0.1 * src_pos
+            x = x + 0.1 * src_pos
 
-        # Compute RoPE frequencies for current frame spatial grid (flux format)
-        B, N, C = src.shape
+        B, N, C = x.shape
         hw = int(math.sqrt(N))
+        assert hw * hw == N, f"spatial dim {N} is not a perfect square"
         num_heads = self.layers[0].num_heads
-        rope = rope_2d(hw, hw, C // num_heads).to(device=src.device)
+        rope = rope_2d(hw, hw, C // num_heads).to(device=x.device)
 
         for layer in self.layers:
-            src = layer(src, memory, memory_pos=memory_pos, rope=rope, num_k_exclude_rope=num_k_exclude_rope)
-        return self.norm(src)
+            x = layer(x, memory, memory_pos=memory_pos, rope=rope, num_k_exclude_rope=num_k_exclude_rope)
+        return self.norm(x)
 
 
 class MemoryTransformer(nn.Module):
@@ -336,9 +369,7 @@ class SAMMaskDecoder(nn.Module):
                 high_res_features=None, multimask_output=False, return_all=False):
         B = sparse_prompt_embeddings.shape[0]
         # Token order: [obj_score(1), iou(1), mask(num_mask_tokens)]
-        tokens = torch.cat([cast_to_input(self.obj_score_token.weight, image_embeddings),
-                            cast_to_input(self.iou_token.weight, image_embeddings),
-                            cast_to_input(self.mask_tokens.weight, image_embeddings)], dim=0)
+        tokens = torch.cat([self.obj_score_token.weight, self.iou_token.weight, self.mask_tokens.weight], dim=0)
         tokens = torch.cat([tokens.unsqueeze(0).expand(B, -1, -1), sparse_prompt_embeddings], dim=1)
 
         src = image_embeddings
@@ -530,32 +561,31 @@ class DecoupledMemoryAttnLayer(nn.Module):
         self.norm2 = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.norm3 = operations.LayerNorm(d_model, device=device, dtype=dtype)
 
-    def forward(self, image, tgt, memory_image, memory, query_pos=None, memory_image_pos=None,
+    def forward(self, image, x, memory_image, memory, memory_image_pos=None,
                 rope=None, num_k_exclude_rope=0):
         # Self-attention with RoPE
-        tgt2 = self.norm1(tgt)
-        q = self.self_attn_q_proj(tgt2)
-        k = self.self_attn_k_proj(tgt2)
-        v = self.self_attn_v_proj(tgt2)
+        normed = self.norm1(x)
+        q = self.self_attn_q_proj(normed)
+        k = self.self_attn_k_proj(normed)
+        v = self.self_attn_v_proj(normed)
         if rope is not None:
             q, k = apply_rope_memory(q, k, rope, self.num_heads, 0)
-        tgt = tgt + self.self_attn_out_proj(optimized_attention(q, k, v, self.num_heads))
+        x = x + self.self_attn_out_proj(optimized_attention(q, k, v, self.num_heads))
 
         # Decoupled cross-attention: fuse image and memory projections
-        tgt2 = self.norm2(tgt)
-        q = self.image_cross_attn_q_proj(image) + self.cross_attn_q_proj(tgt2)
+        normed = self.norm2(x)
+        q = self.image_cross_attn_q_proj(image) + self.cross_attn_q_proj(normed)
         k = self.image_cross_attn_k_proj(memory_image) + self.cross_attn_k_proj(memory)
         if memory_image_pos is not None:
             k = k + memory_image_pos
         v = self.cross_attn_v_proj(memory)
         if rope is not None:
             q, k = apply_rope_memory(q, k, rope, self.num_heads, num_k_exclude_rope)
-        tgt = tgt + self.cross_attn_out_proj(optimized_attention(q, k, v, self.num_heads))
+        x = x + self.cross_attn_out_proj(optimized_attention(q, k, v, self.num_heads))
 
-        # FFN (gelu activation matching reference)
-        tgt2 = self.norm3(tgt)
-        tgt = tgt + self.linear2(F.gelu(self.linear1(tgt2)))
-        return image, tgt
+        # FFN
+        x = x + self.linear2(F.gelu(self.linear1(self.norm3(x))))
+        return image, x
 
 
 class DecoupledMemoryEncoder(nn.Module):
@@ -569,17 +599,18 @@ class DecoupledMemoryEncoder(nn.Module):
         ])
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
 
-    def forward(self, src, memory, memory_pos=None, src_pos=None, num_k_exclude_rope=0,
+    def forward(self, x, memory, memory_pos=None, src_pos=None, num_k_exclude_rope=0,
                 memory_image=None, memory_image_pos=None):
-        image = src  # constant residual
-        output = src
+        image = x  # constant residual for decoupled cross-attention
+        output = x
         if src_pos is not None:
             output = output + 0.1 * src_pos
 
-        B, N, C = src.shape
+        B, N, C = x.shape
         hw = int(math.sqrt(N))
+        assert hw * hw == N, f"spatial dim {N} is not a perfect square"
         num_heads = self.layers[0].num_heads
-        rope = rope_2d(hw, hw, C // num_heads).to(device=src.device)
+        rope = rope_2d(hw, hw, C // num_heads).to(device=x.device)
 
         # memory_image: raw backbone features from past frames for decoupled cross-attention
         if memory_image is None:
@@ -602,8 +633,8 @@ class DecoupledMemoryEncoder(nn.Module):
 
         for layer in self.layers:
             image, output = layer(image, output, memory_image, memory,
-                                  query_pos=src_pos, memory_image_pos=memory_image_pos,
-                                  rope=rope, num_k_exclude_rope=num_k_exclude_rope)
+                                  memory_image_pos=memory_image_pos, rope=rope,
+                                  num_k_exclude_rope=num_k_exclude_rope)
 
         return self.norm(output)
 
@@ -623,7 +654,8 @@ class MemoryBackbone(nn.Module):
         self.mask_downsampler = MaskDownSampler(d_model, in_chans=in_chans, channels=channels, device=device, dtype=dtype, operations=operations)
         self.pix_feat_proj = operations.Conv2d(d_model, d_model, kernel_size=1, device=device, dtype=dtype)
         self.fuser = Fuser(d_model, num_layers=2, device=device, dtype=dtype, operations=operations)
-        if out_dim is not None and out_dim != d_model:
+        self.has_out_proj = out_dim is not None and out_dim != d_model
+        if self.has_out_proj:
             self.out_proj = operations.Conv2d(d_model, out_dim, kernel_size=1, device=device, dtype=dtype)
             feat_dim = out_dim
         else:
@@ -638,7 +670,7 @@ class MemoryBackbone(nn.Module):
             mask_features = F.interpolate(mask_features, size=image_features.shape[-2:], mode="bilinear", align_corners=False)
         features = self.pix_feat_proj(image_features) + mask_features
         features = self.fuser(features)
-        if hasattr(self, 'out_proj'):
+        if self.has_out_proj:
             features = self.out_proj(features)
         pos = cast_to_input(self.position_encoding(features), features)
         return {"vision_features": features, "vision_pos_enc": [pos]}
@@ -688,22 +720,14 @@ class MultiplexMaskDecoder(nn.Module):
         T = self.num_mask_output_per_object
 
         # Token order: [obj_score(M), iou(M), mask(M*T)]
-        mask_tokens = cast_to_input(self.mask_tokens.weight, image_embeddings)
+        mask_tokens = self.mask_tokens.weight
         if extra_per_object_embeddings is not None:
-            # extra_per_object_embeddings: [B, M, C] — add per-object embedding to each object's mask tokens
             mask_tokens = mask_tokens.view(1, M, T, -1).expand(B, -1, -1, -1) + extra_per_object_embeddings.unsqueeze(2)
             mask_tokens = mask_tokens.flatten(1, 2)  # [B, M*T, C]
-            other_tokens = torch.cat([
-                cast_to_input(self.obj_score_token.weight, image_embeddings),
-                cast_to_input(self.iou_token.weight, image_embeddings),
-            ], dim=0).unsqueeze(0).expand(B, -1, -1)
+            other_tokens = torch.cat([self.obj_score_token.weight, self.iou_token.weight], dim=0).unsqueeze(0).expand(B, -1, -1)
             tokens = torch.cat([other_tokens, mask_tokens, sparse_prompt_embeddings], dim=1)
         else:
-            tokens = torch.cat([
-                cast_to_input(self.obj_score_token.weight, image_embeddings),
-                cast_to_input(self.iou_token.weight, image_embeddings),
-                mask_tokens,
-            ], dim=0)
+            tokens = torch.cat([self.obj_score_token.weight, self.iou_token.weight, mask_tokens], dim=0)
             tokens = torch.cat([tokens.unsqueeze(0).expand(B, -1, -1), sparse_prompt_embeddings], dim=1)
 
         src = image_embeddings
@@ -770,7 +794,7 @@ class SAM3Tracker(nn.Module):
         # Standalone parameters
         self.maskmem_tpos_enc = nn.Parameter(torch.zeros(num_maskmem, 1, 1, mem_dim, device=device, dtype=dtype))
         self.no_mem_embed = nn.Parameter(torch.zeros(1, 1, d_model, device=device, dtype=dtype))
-        self.no_mem_pos_enc = nn.Parameter(torch.zeros(1, 1, d_model, device=device, dtype=dtype))  # checkpoint key, unused in forward
+        self.register_buffer("no_mem_pos_enc", torch.zeros(1, 1, d_model, device=device, dtype=dtype))  # checkpoint key, unused in forward
         self.no_obj_embed_spatial = nn.Parameter(torch.zeros(1, mem_dim, device=device, dtype=dtype))
         self.no_obj_ptr = nn.Parameter(torch.zeros(1, d_model, device=device, dtype=dtype))
 
@@ -795,7 +819,7 @@ class SAM3Tracker(nn.Module):
     def _get_tpos_enc(self, rel_pos_list, device, dtype=None, max_abs_pos=None):
         return compute_tpos_enc(rel_pos_list, device, self.d_model, self.obj_ptr_tpos_proj, dtype, max_abs_pos)
 
-    def _no_obj_blend(self, obj_ptr, sam_token, is_obj):
+    def _no_obj_blend(self, obj_ptr, is_obj):
         alpha = is_obj.to(obj_ptr.dtype)
         return torch.lerp(cast_to_input(self.no_obj_ptr, obj_ptr), obj_ptr, alpha)
 
@@ -824,55 +848,14 @@ class SAM3Tracker(nn.Module):
             pix_feat = current_vision_feats[-1] + cast_to_input(self.no_mem_embed, current_vision_feats[-1])
             return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
 
-        # Collect spatial memory and position encodings
-        to_cat_memory = []  # [B, HW, mem_dim]
-        to_cat_memory_pos = []  # [B, HW, mem_dim]
+        to_cat_memory, to_cat_memory_pos, _, _, cond_outputs = collect_memory_tokens(
+            output_dict, frame_idx, self.num_maskmem, self.maskmem_tpos_enc, device)
 
-        # Add conditioning frames (t_pos=0 for temporal encoding)
-        cond_outputs = output_dict["cond_frame_outputs"]
-        for t, out in cond_outputs.items():
-            feats = out["maskmem_features"].to(device)  # [B, mem_dim, H, W]
-            to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))  # [B, HW, mem_dim]
-
-            maskmem_enc = out["maskmem_pos_enc"][-1].to(device)  # [B, mem_dim, H, W]
-            maskmem_enc = maskmem_enc.flatten(2).permute(0, 2, 1)
-            # Add temporal encoding for conditioning frame (t=0)
-            maskmem_enc = maskmem_enc + cast_to_input(self.maskmem_tpos_enc[self.num_maskmem - 1], maskmem_enc)
-            to_cat_memory_pos.append(maskmem_enc)
-
-        # Add recent non-conditioning frames
-        for t_pos in range(1, self.num_maskmem):
-            t_rel = self.num_maskmem - t_pos
-            if t_rel == 1:
-                prev_frame_idx = frame_idx - 1
-            else:
-                prev_frame_idx = frame_idx - t_rel
-
-            out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
-            if out is None:
-                continue
-
-            feats = out["maskmem_features"]
-            if feats is None:
-                continue
-            feats = feats.to(device)
-            to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
-
-            maskmem_enc = out["maskmem_pos_enc"][-1].to(device)
-            maskmem_enc = maskmem_enc.flatten(2).permute(0, 2, 1)
-            maskmem_enc = maskmem_enc + cast_to_input(self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1], maskmem_enc)
-            to_cat_memory_pos.append(maskmem_enc)
-
-        # Collect object pointers from past frames
         max_obj_ptrs = min(num_frames, self.max_obj_ptrs_in_encoder)
         pos_and_ptrs = []
-
-        # Object pointers from conditioning frames
         for t, out in cond_outputs.items():
             if t <= frame_idx:
                 pos_and_ptrs.append(((frame_idx - t), out["obj_ptr"].to(device)))
-
-        # Object pointers from recent non-conditioning frames
         for t_diff in range(1, max_obj_ptrs):
             t = frame_idx - t_diff
             if t < 0:
@@ -910,18 +893,18 @@ class SAM3Tracker(nn.Module):
             return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
 
         # Concatenate all memory and position encodings [B, total_mem, mem_dim=64]
-        memory = torch.cat([t.to(device) for t in to_cat_memory], dim=1)
-        memory_pos = torch.cat([t.to(device) for t in to_cat_memory_pos], dim=1)
+        memory = torch.cat(to_cat_memory, dim=1)
+        memory_pos = torch.cat(to_cat_memory_pos, dim=1)
 
         # Run memory attention encoder
         pix_feat = current_vision_feats[-1]  # [B, HW, C]
         src_pos = current_vision_pos_embeds[-1]  # [B, HW, C]
 
         pix_feat_with_mem = self.transformer.encoder(
-            src=pix_feat, # current frame features [B, HW, C=256]
-            memory=memory, # past memory [B, total_mem, mem_dim=64]
-            src_pos=src_pos, # spatial pos for current frame [B, HW, C=256]
-            memory_pos=memory_pos, # spatial + temporal pos for memory [B, total_mem, mem_dim=64]
+            x=pix_feat,
+            memory=memory,
+            src_pos=src_pos,
+            memory_pos=memory_pos,
             num_k_exclude_rope=num_obj_ptr_tokens,
         )
         return pix_feat_with_mem.view(B, H, W, C).permute(0, 3, 1, 2)
@@ -1053,6 +1036,11 @@ class SAM3Tracker(nn.Module):
                 output_dict["cond_frame_outputs"][frame_idx] = current_out
             else:
                 output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+                # Prune old frames outside lookback window to bound VRAM
+                lookback = max(self.num_maskmem, self.max_obj_ptrs_in_encoder)
+                for old_idx in list(output_dict["non_cond_frame_outputs"]):
+                    if old_idx < frame_idx - lookback:
+                        del output_dict["non_cond_frame_outputs"][old_idx]
             all_masks.append(current_out["pred_masks_high_res"])
             if pbar is not None:
                 pbar.update(1)
@@ -1138,9 +1126,9 @@ class SAM31Tracker(nn.Module):
     def _get_tpos_enc(self, rel_pos_list, device, dtype=None, max_abs_pos=None):
         return compute_tpos_enc(rel_pos_list, device, self.d_model, self.obj_ptr_tpos_proj, dtype, max_abs_pos)
 
-    def _no_obj_blend(self, obj_ptr, sam_token, is_obj):
+    def _no_obj_blend(self, obj_ptr, is_obj):
         alpha = is_obj.to(obj_ptr.dtype)
-        return torch.lerp(self.no_obj_ptr_linear(sam_token), obj_ptr, alpha)
+        return torch.lerp(self.no_obj_ptr_linear(obj_ptr), obj_ptr, alpha)
 
     def _forward_sam_heads(self, backbone_features, point_inputs=None, mask_inputs=None,
                            high_res_features=None, multimask_output=False):
@@ -1168,39 +1156,8 @@ class SAM31Tracker(nn.Module):
             pix_feat = current_vision_feats[-1] + cast_to_input(self.interactivity_no_mem_embed, current_vision_feats[-1])
             return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
 
-        to_cat_memory = []
-        to_cat_memory_pos = []
-        to_cat_image_feat = []
-        to_cat_image_pos = []
-
-        cond_outputs = output_dict["cond_frame_outputs"]
-        for t, out in cond_outputs.items():
-            feats = out["maskmem_features"].to(device)
-            to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
-            maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
-            tpos_enc = cast_to_input(self.maskmem_tpos_enc[self.num_maskmem - 1], maskmem_enc)
-            maskmem_enc = maskmem_enc + tpos_enc
-            to_cat_memory_pos.append(maskmem_enc)
-            # Store image features for decoupled cross-attention
-            if "image_features" in out:
-                to_cat_image_feat.append(out["image_features"].to(device))
-                to_cat_image_pos.append(out["image_pos_enc"].to(device) + tpos_enc)
-
-        for t_pos in range(1, self.num_maskmem):
-            t_rel = self.num_maskmem - t_pos
-            prev_frame_idx = frame_idx - 1 if t_rel == 1 else frame_idx - t_rel
-            out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
-            if out is None or out.get("maskmem_features") is None:
-                continue
-            feats = out["maskmem_features"].to(device)
-            to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
-            maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
-            tpos_enc = cast_to_input(self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1], maskmem_enc)
-            maskmem_enc = maskmem_enc + tpos_enc
-            to_cat_memory_pos.append(maskmem_enc)
-            if "image_features" in out:
-                to_cat_image_feat.append(out["image_features"].to(device))
-                to_cat_image_pos.append(out["image_pos_enc"].to(device) + tpos_enc)
+        to_cat_memory, to_cat_memory_pos, to_cat_image_feat, to_cat_image_pos, cond_outputs = collect_memory_tokens(
+            output_dict, frame_idx, self.num_maskmem, self.maskmem_tpos_enc, device, collect_image_feats=True)
 
         max_obj_ptrs = min(num_frames, self.max_obj_ptrs_in_encoder)
         pos_and_ptrs = []
@@ -1233,17 +1190,17 @@ class SAM31Tracker(nn.Module):
             pix_feat = current_vision_feats[-1] + cast_to_input(self.interactivity_no_mem_embed, current_vision_feats[-1])
             return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
 
-        memory = torch.cat([t.to(device) for t in to_cat_memory], dim=1)
-        memory_pos = torch.cat([t.to(device) for t in to_cat_memory_pos], dim=1)
+        memory = torch.cat(to_cat_memory, dim=1)
+        memory_pos = torch.cat(to_cat_memory_pos, dim=1)
 
         if len(to_cat_image_feat) > 0:
             # Decoupled cross-attention: separate image features from memory
             # Cast to match src dtype (position encodings may promote to fp32)
             src = current_vision_feats[-1]
-            memory_image = cast_to_input(torch.cat([t.to(device) for t in to_cat_image_feat], dim=1), src)
-            memory_image_pos = cast_to_input(torch.cat([t.to(device) for t in to_cat_image_pos], dim=1), src)
+            memory_image = cast_to_input(torch.cat(to_cat_image_feat, dim=1), src)
+            memory_image_pos = cast_to_input(torch.cat(to_cat_image_pos, dim=1), src)
             pix_feat_with_mem = self.transformer.encoder(
-                src=src,
+                x=src,
                 memory=cast_to_input(memory, src),
                 memory_pos=cast_to_input(memory_pos, src),
                 src_pos=cast_to_input(current_vision_pos_embeds[-1], src),
@@ -1253,7 +1210,7 @@ class SAM31Tracker(nn.Module):
             )
         else:
             pix_feat_with_mem = self.transformer.encoder(
-                src=current_vision_feats[-1],
+                x=current_vision_feats[-1],
                 memory=memory,
                 memory_pos=memory_pos,
                 src_pos=current_vision_pos_embeds[-1],
@@ -1327,11 +1284,10 @@ class SAM31Tracker(nn.Module):
 
         # Select best mask by IoU for each object
         best_idx = torch.argmax(iou_obj, dim=-1)  # [N_obj]
-        obj_range = torch.arange(masks_obj.shape[0], device=device)
+        N_obj = masks_obj.shape[0]
+        obj_range = torch.arange(N_obj, device=device)
         low_res_masks = masks_obj[obj_range, best_idx].unsqueeze(1)  # [N_obj, 1, H, W]
-        # Take first object for output
-        low_res_out = low_res_masks[0:1]  # [1, 1, H, W]
-        high_res_out = F.interpolate(low_res_out.float(), size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        high_res_masks = F.interpolate(low_res_masks.float(), size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
 
         # Object pointer: compute per-object, mux for storage as [num_buckets, M, C]
         sam_token = tokens_obj[:, 0]  # [N_obj, C]
@@ -1341,7 +1297,7 @@ class SAM31Tracker(nn.Module):
         obj_ptr = is_obj * obj_ptr + (1 - is_obj) * no_obj
         obj_ptr_muxed = multiplex_state.mux(obj_ptr)  # [num_buckets, M, C]
 
-        return low_res_out, high_res_out, obj_ptr_muxed, score_obj[0:1]
+        return low_res_masks, high_res_masks, obj_ptr_muxed, score_obj
 
     def track_step(self, frame_idx, is_init_cond_frame, current_vision_feats, current_vision_pos_embeds,
                    feat_sizes, mask_inputs, output_dict, num_frames, point_inputs=None,
@@ -1357,10 +1313,13 @@ class SAM31Tracker(nn.Module):
             if interactive_backbone is not None:
                 pix_feat = interactive_backbone
                 # Add no_mem_embed for interactive path
-                bf = pix_feat.flatten(2).permute(0, 2, 1) + cast_to_input(self.interactivity_no_mem_embed, pix_feat.flatten(2))
+                pix_flat = pix_feat.flatten(2)
+                bf = pix_flat.permute(0, 2, 1) + cast_to_input(self.interactivity_no_mem_embed, pix_flat)
                 pix_feat = bf.view(B, H, W, C).permute(0, 3, 1, 2)
                 hi_res = interactive_high_res
             else:
+                # Fallback: interactive backbone not available (e.g. called outside track_video).
+                # Propagation features work but may produce lower-quality conditioning.
                 pix_feat = current_vision_feats[-1].view(B, H, W, C).permute(0, 3, 1, 2)
                 hi_res = propagation_high_res
             sam_outputs = self._use_mask_as_output(pix_feat, hi_res, mask_inputs)
@@ -1389,7 +1348,6 @@ class SAM31Tracker(nn.Module):
                                                      multiplex_state=multiplex_state)
 
         (low_res_masks, high_res_masks, obj_ptr, object_score_logits) = sam_outputs
-        high_res_masks = F.interpolate(low_res_masks.float(), size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
 
         # Mux obj_ptr if it came from interactive path (shape [B, C]) vs propagation ([num_buckets, M, C])
         if multiplex_state is not None and obj_ptr.dim() == 2:
@@ -1430,29 +1388,32 @@ class SAM31Tracker(nn.Module):
             feat_sizes = [(x.shape[-2], x.shape[-1]) for x in tracker_features]
             vision_feats = [x.flatten(2).permute(0, 2, 1) for x in tracker_features]
             vision_pos = [x.flatten(2).permute(0, 2, 1) for x in tracker_positions]
-            high_res = [f for f in tracker_features[:-1]]
+            high_res = list(tracker_features[:-1])
             cached.append((vision_feats, vision_pos, feat_sizes, high_res, tracker_features[-1], trunk_out))
         return cached
 
-    def _track_single_object(self, cached_features, images, initial_mask, backbone_obj=None, pbar=None):
-        """Track one object using pre-computed backbone features."""
+    def _track_objects(self, cached_features, images, initial_masks, backbone_obj=None, pbar=None):
+        """Track objects using pre-computed backbone features with multiplex decoder.
+
+        Args:
+            initial_masks: [N_obj, 1, H, W] binary masks for first frame
+        """
         N = len(cached_features)
+        N_obj = initial_masks.shape[0]
         device, dt = images.device, images.dtype
         output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
         all_masks = []
 
-        # Create multiplex state for 1 object
-        mux_state = MultiplexState(num_objects=1, multiplex_count=self.num_multiplex, device=device, dtype=dt)
+        mux_state = MultiplexState(num_objects=N_obj, multiplex_count=self.num_multiplex, device=device, dtype=dt)
 
         for frame_idx in range(N):
             vision_feats, vision_pos, feat_sizes, high_res_prop, low_res_feat, _trunk = cached_features[frame_idx]
             mask_input = None
             if frame_idx == 0:
-                mask_input = F.interpolate(initial_mask.to(device=device, dtype=dt),
+                mask_input = F.interpolate(initial_masks.to(device=device, dtype=dt),
                     size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
                 mask_input = (mask_input > 0.5).to(dt)
 
-            # For conditioning frames with mask, get interactive features (reuse cached trunk)
             interactive_high_res = None
             interactive_backbone = None
             if mask_input is not None and backbone_obj is not None and backbone_obj.multiplex:
@@ -1472,22 +1433,17 @@ class SAM31Tracker(nn.Module):
                 output_dict["cond_frame_outputs"][frame_idx] = current_out
             else:
                 output_dict["non_cond_frame_outputs"][frame_idx] = current_out
-            all_masks.append(current_out["pred_masks_high_res"])
+                lookback = max(self.num_maskmem, self.max_obj_ptrs_in_encoder)
+                for old_idx in list(output_dict["non_cond_frame_outputs"]):
+                    if old_idx < frame_idx - lookback:
+                        del output_dict["non_cond_frame_outputs"][old_idx]
+            all_masks.append(current_out["pred_masks_high_res"][:, 0])
             if pbar is not None:
                 pbar.update(1)
 
-        return torch.cat(all_masks, dim=0)  # [N, 1, H, W]
+        return torch.stack(all_masks, dim=0)  # [N, N_obj, H, W]
 
     def track_video(self, backbone_fn, images, initial_masks, pbar=None, backbone_obj=None):
-        """Track one or more objects across video frames."""
+        """Track objects across video frames using multiplex decoder."""
         cached = self._precompute_backbone(backbone_fn, images)
-
-        N_obj = initial_masks.shape[0]
-        per_object = []
-        for obj_idx in range(N_obj):
-            obj_masks = self._track_single_object(
-                cached, images, initial_masks[obj_idx:obj_idx + 1],
-                backbone_obj=backbone_obj, pbar=pbar)
-            per_object.append(obj_masks)
-
-        return torch.cat(per_object, dim=1)  # [N, N_obj, H, W]
+        return self._track_objects(cached, images, initial_masks, backbone_obj=backbone_obj, pbar=pbar)

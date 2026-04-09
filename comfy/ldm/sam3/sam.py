@@ -112,5 +112,3 @@ class PositionEmbeddingRandom(nn.Module):
         norm[:, :, 0] /= image_size[1]
         norm[:, :, 1] /= image_size[0]
         return self._encode(norm)
-
-

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.sam3.tracker import SAM3Tracker, SAM31Tracker
 from comfy.ldm.sam3.backbone import SAM3VisionBackbone  # noqa: used in __init__
+from comfy.ldm.sam3.sam import MLP
 
 TRACKER_CLASSES = {"SAM3": SAM3Tracker, "SAM31": SAM31Tracker}
 from comfy.ops import cast_to_input
@@ -56,23 +57,6 @@ class SplitMHA(nn.Module):
         return self.out_proj(out)
 
 
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, device=None, dtype=None, operations=None):
-        super().__init__()
-        dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
-        self.layers = nn.ModuleList([
-            operations.Linear(dims[i], dims[i + 1], device=device, dtype=dtype)
-            for i in range(num_layers)
-        ])
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i < len(self.layers) - 1:
-                x = F.relu(x)
-        return x
-
-
 class MLPWithNorm(nn.Module):
     """MLP with residual connection and output LayerNorm."""
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers, residual=True, device=None, dtype=None, operations=None):
@@ -107,21 +91,16 @@ class EncoderLayer(nn.Module):
         self.norm2 = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.norm3 = operations.LayerNorm(d_model, device=device, dtype=dtype)
 
-    def forward(self, src, pos, text_memory=None, text_mask=None):
-        # Pre-norm
-        src2 = self.norm1(src)
-        q_k = src2 + pos
-        src2 = self.self_attn(q_k, q_k, src2)
-        src = src + src2
+    def forward(self, x, pos, text_memory=None, text_mask=None):
+        normed = self.norm1(x)
+        q_k = normed + pos
+        x = x + self.self_attn(q_k, q_k, normed)
         if text_memory is not None:
-            src2 = self.norm2(src)
-            src2 = self.cross_attn_image(src2, text_memory, text_memory, mask=text_mask)
-            src = src + src2
-        # FFN
-        src2 = self.norm3(src)
-        src2 = self.linear2(F.relu(self.linear1(src2)))
-        src = src + src2
-        return src
+            normed = self.norm2(x)
+            x = x + self.cross_attn_image(normed, text_memory, text_memory, mask=text_mask)
+        normed = self.norm3(x)
+        x = x + self.linear2(F.relu(self.linear1(normed)))
+        return x
 
 
 class TransformerEncoder(nn.Module):
@@ -133,10 +112,10 @@ class TransformerEncoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, src, pos, text_memory=None, text_mask=None):
+    def forward(self, x, pos, text_memory=None, text_mask=None):
         for layer in self.layers:
-            src = layer(src, pos, text_memory, text_mask)
-        return src
+            x = layer(x, pos, text_memory, text_mask)
+        return x
 
 
 class DecoderLayer(nn.Module):
@@ -152,17 +131,14 @@ class DecoderLayer(nn.Module):
         self.linear1 = operations.Linear(d_model, dim_ff, device=device, dtype=dtype)
         self.linear2 = operations.Linear(dim_ff, d_model, device=device, dtype=dtype)
 
-    def forward(self, tgt, memory, tgt_pos, memory_pos, text_memory=None, text_mask=None, cross_attn_bias=None):
-        # Post-norm: self-attn → text cross-attn → image cross-attn → FFN
-        q_k = tgt + tgt_pos
-        tgt = self.norm2(tgt + self.self_attn(q_k, q_k, tgt))
+    def forward(self, x, memory, x_pos, memory_pos, text_memory=None, text_mask=None, cross_attn_bias=None):
+        q_k = x + x_pos
+        x = self.norm2(x + self.self_attn(q_k, q_k, x))
         if text_memory is not None:
-            tgt = self.catext_norm(tgt + self.ca_text(tgt + tgt_pos, text_memory, text_memory, mask=text_mask))
-        tgt = self.norm1(tgt + self.cross_attn(tgt + tgt_pos, memory + memory_pos, memory, mask=cross_attn_bias))
-        tgt2 = self.linear2(F.relu(self.linear1(tgt)))
-        tgt = tgt + tgt2
-        tgt = self.norm3(tgt)
-        return tgt
+            x = self.catext_norm(x + self.ca_text(x + x_pos, text_memory, text_memory, mask=text_mask))
+        x = self.norm1(x + self.cross_attn(x + x_pos, memory + memory_pos, memory, mask=cross_attn_bias))
+        x = self.norm3(x + self.linear2(F.relu(self.linear1(x))))
+        return x
 
 
 class TransformerDecoder(nn.Module):
@@ -188,6 +164,10 @@ class TransformerDecoder(nn.Module):
         self.presence_token = operations.Embedding(1, d_model, device=device, dtype=dtype)
         self.presence_token_head = MLP(d_model, d_model, 1, 3, device=device, dtype=dtype, operations=operations)
         self.presence_token_out_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+
+    @staticmethod
+    def _inverse_sigmoid(x):
+        return torch.log(x / (1 - x + 1e-6) + 1e-6)
 
     def _compute_box_rpb(self, ref_points, H, W):
         """Box rotary position bias: (B, Q, 4) cxcywh -> (B, n_heads, Q+1, H*W) bias."""
@@ -223,11 +203,11 @@ class TransformerDecoder(nn.Module):
                                   text_memory, text_mask, self._compute_box_rpb(ref_points, H, W))
             presence_out, tgt = tgt_with_pres[:, :1], tgt_with_pres[:, 1:]
             if layer_idx < len(self.layers) - 1:
-                ref_inv = torch.log(ref_points / (1 - ref_points + 1e-6) + 1e-6)
+                ref_inv = self._inverse_sigmoid(ref_points)
                 ref_points = (ref_inv + self.bbox_embed(self.norm(tgt))).sigmoid().detach()
 
         query_out = self.norm(tgt)
-        ref_inv = torch.log(ref_points / (1 - ref_points + 1e-6) + 1e-6)
+        ref_inv = self._inverse_sigmoid(ref_points)
         boxes = (ref_inv + self.bbox_embed(query_out)).sigmoid()
         presence = self.presence_token_head(self.presence_token_out_norm(presence_out)).squeeze(-1)
         return {"decoder_output": query_out, "pred_boxes": boxes, "presence": presence}
@@ -359,7 +339,6 @@ class DotProductScoring(nn.Module):
 class SAM3Detector(nn.Module):
     def __init__(self, d_model=256, embed_dim=1024, num_queries=200, device=None, dtype=None, operations=None, **kwargs):
         super().__init__()
-        self.dtype = dtype
         image_model = kwargs.pop("image_model", "SAM3")
         for k in ("num_heads", "num_head_channels"):
             kwargs.pop(k, None)
@@ -387,12 +366,11 @@ class SAM3Detector(nn.Module):
         return all_f, all_p, tf, tp
 
     @staticmethod
-    def _run_geo_layer(layer, tgt, memory, memory_pos):
-        """Pre-norm encoder layer with pos_enc_at_cross_attn_keys=True only."""
-        tgt = tgt + layer.self_attn(layer.norm1(tgt), layer.norm1(tgt), layer.norm1(tgt))
-        tgt = tgt + layer.cross_attn_image(layer.norm2(tgt), memory + memory_pos, memory)
-        tgt = tgt + layer.linear2(F.relu(layer.linear1(layer.norm3(tgt))))
-        return tgt
+    def _run_geo_layer(layer, x, memory, memory_pos):
+        x = x + layer.self_attn(layer.norm1(x))
+        x = x + layer.cross_attn_image(layer.norm2(x), memory + memory_pos, memory)
+        x = x + layer.linear2(F.relu(layer.linear1(layer.norm3(x))))
+        return x
 
     def forward(self, images, text_embeddings=None, text_mask=None, points=None, boxes=None, threshold=0.3, orig_size=None):
         B = images.shape[0]
@@ -440,8 +418,7 @@ class SAM3Detector(nn.Module):
 
         masks = self.segmentation_head(query_out, features, encoder_hidden_states=memory, prompt=text_embeddings, prompt_mask=text_mask)
 
-        cx, cy, w, h = pred_boxes.unbind(-1)
-        boxes_xyxy = torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], dim=-1)
+        boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes)
         if orig_size is not None:
             oh, ow = orig_size
             boxes_xyxy = boxes_xyxy * torch.tensor([ow, oh, ow, oh], device=boxes_xyxy.device, dtype=boxes_xyxy.dtype)
