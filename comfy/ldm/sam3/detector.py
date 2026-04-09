@@ -506,14 +506,12 @@ class SAM3Model(nn.Module):
         return high_res_masks
 
     def forward_video(self, images, initial_masks, pbar=None):
-        cached = getattr(self.detector, '_cached_tracker_features', None)
-        self.detector._cached_tracker_features = None
+        bb = self.detector.backbone["vision_backbone"]
         def backbone_fn(frame):
-            nonlocal cached
-            if cached is not None:
-                out = cached
-                cached = None
-                return out
-            _, _, tf, tp = self.detector._get_backbone_features(frame)
-            return tf, tp
-        return self.tracker.track_video(backbone_fn, images, initial_masks, pbar=pbar)
+            trunk_out = bb.trunk(frame)
+            if bb.multiplex:
+                _, _, tf, tp = bb(frame, tracker_mode="propagation", cached_trunk=trunk_out)
+            else:
+                _, _, tf, tp = bb(frame, need_tracker=True, cached_trunk=trunk_out)
+            return tf, tp, trunk_out
+        return self.tracker.track_video(backbone_fn, images, initial_masks, pbar=pbar, backbone_obj=bb)

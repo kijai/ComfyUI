@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import comfy.model_management
 import comfy.utils
+from comfy.ldm.sam3.tracker import fill_holes_in_mask_scores
 from comfy_api.latest import ComfyExtension, io
 
 
@@ -30,7 +31,7 @@ class SAM3_Detect(io.ComfyNode):
                 io.String.Input("positive_coords", display_name="positive_coords", force_input=True, optional=True, tooltip="Positive point prompts as JSON [{\"x\": int, \"y\": int}, ...] (pixel coords)"),
                 io.String.Input("negative_coords", display_name="negative_coords", force_input=True, optional=True, tooltip="Negative point prompts as JSON [{\"x\": int, \"y\": int}, ...] (pixel coords)"),
                 io.Float.Input("threshold", display_name="threshold", default=0.3, min=0.0, max=1.0, step=0.01),
-                io.Int.Input("max_detections", display_name="max_detections", default=50, min=1, max=200),
+                io.Int.Input("max_detections", display_name="max_detections", default=1, min=1, max=200),
             ],
             outputs=[
                 io.BoundingBox.Output("bboxes"),
@@ -93,11 +94,13 @@ class SAM3_Detect(io.ComfyNode):
                 "point_labels": torch.tensor([all_labels], dtype=torch.int32, device=device),
             }
             all_masks = []
+            pbar = comfy.utils.ProgressBar(B)
             for b in range(B):
                 frame = image_in[b:b+1].to(device=device, dtype=dtype)
                 mask_logits = sam3_model.forward_segment(frame, point_inputs=point_inputs)
                 mask = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
                 all_masks.append((mask[:, 0] > 0).float())
+                pbar.update(1)
             mask_out = torch.cat(all_masks, dim=0)
             return io.NodeOutput([[] for _ in range(B)], mask_out)
 
@@ -110,6 +113,7 @@ class SAM3_Detect(io.ComfyNode):
         has_text = conditioning is not None and len(conditioning) > 0
         all_bbox_dicts = []
         all_masks = []
+        pbar = comfy.utils.ProgressBar(B)
 
         for b in range(B):
             frame = image_in[b:b+1].to(device=device, dtype=dtype)
@@ -153,12 +157,15 @@ class SAM3_Detect(io.ComfyNode):
                 ]
                 all_bbox_dicts.append(bbox_dicts)
                 if b_masks.shape[0] > 0:
-                    all_masks.append((b_masks[0] > 0).float())
+                    mask_logit = fill_holes_in_mask_scores(b_masks[0:1].unsqueeze(0), max_area=200)[0, 0]
+                    all_masks.append((mask_logit > 0).float())
                 else:
                     all_masks.append(torch.zeros(H, W, device=comfy.model_management.intermediate_device()))
             else:
                 all_bbox_dicts.append([])
-                all_masks.append((frame_masks[0] > 0).float())
+                mask_logit = fill_holes_in_mask_scores(frame_masks[0:1].unsqueeze(0), max_area=200)[0, 0]
+                all_masks.append((mask_logit > 0).float())
+            pbar.update(1)
 
         mask_out = torch.stack(all_masks)
         return io.NodeOutput(all_bbox_dicts, mask_out)
@@ -203,6 +210,9 @@ class SAM3_VideoTrack(io.ComfyNode):
         # mask_logits: [N, N_obj, image_size, image_size]
 
         N_obj = mask_logits.shape[1]
+        # Clean masks at video resolution (fill holes, remove sprinkles) matching reference
+        mask_logits = fill_holes_in_mask_scores(mask_logits.flatten(0, 1).unsqueeze(1), max_area=16)
+        mask_logits = mask_logits.squeeze(1).view(N, N_obj, mask_logits.shape[-2], mask_logits.shape[-1])
         mask_out = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
         mask_out = (mask_out > 0).float()  # [N, N_obj, H, W]
 
