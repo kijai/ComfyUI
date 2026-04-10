@@ -8,8 +8,8 @@ import torch.nn.functional as F
 
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.sam3.tracker import SAM3Tracker, SAM31Tracker
-from comfy.ldm.sam3.backbone import SAM3VisionBackbone  # noqa: used in __init__
-from comfy.ldm.sam3.sam import MLP
+from comfy.ldm.sam3.sam import SAM3VisionBackbone  # noqa: used in __init__
+from comfy.ldm.sam3.sam import MLP, PositionEmbeddingSine
 
 TRACKER_CLASSES = {"SAM3": SAM3Tracker, "SAM31": SAM31Tracker}
 from comfy.ops import cast_to_input
@@ -222,15 +222,18 @@ class Transformer(nn.Module):
 
 
 class GeometryEncoder(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, num_layers=3, device=None, dtype=None, operations=None):
+    def __init__(self, d_model=256, num_heads=8, num_layers=3, roi_size=7, device=None, dtype=None, operations=None):
         super().__init__()
+        self.d_model = d_model
+        self.roi_size = roi_size
+        self.pos_enc = PositionEmbeddingSine(num_pos_feats=d_model, normalize=True)
         self.points_direct_project = operations.Linear(2, d_model, device=device, dtype=dtype)
         self.points_pool_project = operations.Linear(d_model, d_model, device=device, dtype=dtype)
         self.points_pos_enc_project = operations.Linear(d_model, d_model, device=device, dtype=dtype)
         self.boxes_direct_project = operations.Linear(4, d_model, device=device, dtype=dtype)
-        self.boxes_pool_project = operations.Conv2d(d_model, d_model, kernel_size=7, device=device, dtype=dtype)
-        self.boxes_pos_enc_project = operations.Linear(d_model + 2, d_model, device=device, dtype=dtype)  # 258 input
-        self.label_embed = operations.Embedding(2, d_model, device=device, dtype=dtype)  # 2 labels
+        self.boxes_pool_project = operations.Conv2d(d_model, d_model, kernel_size=roi_size, device=device, dtype=dtype)
+        self.boxes_pos_enc_project = operations.Linear(d_model + 2, d_model, device=device, dtype=dtype)
+        self.label_embed = operations.Embedding(2, d_model, device=device, dtype=dtype)
         self.cls_embed = operations.Embedding(1, d_model, device=device, dtype=dtype)
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.img_pre_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -241,23 +244,69 @@ class GeometryEncoder(nn.Module):
         self.encode_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.final_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
 
+    def _encode_points(self, coords, labels, img_feat_2d):
+        """Encode point prompts: direct + pool + pos_enc + label. coords: [B, N, 2] normalized."""
+        B, N, _ = coords.shape
+        embed = self.points_direct_project(coords)
+        # Pool features from backbone at point locations via grid_sample
+        grid = (coords * 2 - 1).unsqueeze(2)  # [B, N, 1, 2] in [-1, 1]
+        sampled = F.grid_sample(img_feat_2d, grid, align_corners=False)  # [B, C, N, 1]
+        embed = embed + self.points_pool_project(sampled.squeeze(-1).permute(0, 2, 1))  # [B, N, C]
+        # Positional encoding of coordinates
+        x, y = coords[:, :, 0], coords[:, :, 1]  # [B, N]
+        pos_x, pos_y = self.pos_enc._encode_xy(x.flatten(), y.flatten())
+        enc = torch.cat([pos_x, pos_y], dim=-1).view(B, N, -1)
+        embed = embed + self.points_pos_enc_project(cast_to_input(enc, embed))
+        embed = embed + cast_to_input(self.label_embed(labels.long()), embed)
+        return embed
+
+    def _encode_boxes(self, boxes, labels, img_feat_2d):
+        """Encode box prompts: direct + pool + pos_enc + label. boxes: [B, N, 4] normalized cxcywh."""
+        B, N, _ = boxes.shape
+        embed = self.boxes_direct_project(boxes)
+        # ROI align from backbone at box regions
+        H, W = img_feat_2d.shape[-2:]
+        boxes_xyxy = box_cxcywh_to_xyxy(boxes)
+        scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype, device=boxes_xyxy.device)
+        boxes_scaled = boxes_xyxy * scale
+        import torchvision.ops
+        sampled = torchvision.ops.roi_align(img_feat_2d, boxes_scaled.view(-1, 4).split(N), self.roi_size)
+        proj = self.boxes_pool_project(sampled).view(B, N, -1)  # Conv2d(roi_size) -> [B*N, C, 1, 1] -> [B, N, C]
+        embed = embed + proj
+        # Positional encoding of box center + size
+        cx, cy, w, h = boxes[:, :, 0], boxes[:, :, 1], boxes[:, :, 2], boxes[:, :, 3]
+        enc = self.pos_enc.encode_boxes(cx.flatten(), cy.flatten(), w.flatten(), h.flatten())
+        enc = enc.view(B, N, -1)
+        embed = embed + self.boxes_pos_enc_project(cast_to_input(enc, embed))
+        embed = embed + cast_to_input(self.label_embed(labels.long()), embed)
+        return embed
+
     def forward(self, points=None, boxes=None, image_features=None):
+        """Encode geometry prompts. image_features: [B, HW, C] flattened backbone features."""
+        # Prepare 2D image features for pooling
+        img_feat_2d = None
+        if image_features is not None:
+            B = image_features.shape[0]
+            HW, C = image_features.shape[1], image_features.shape[2]
+            hw = int(math.sqrt(HW))
+            img_normed = self.img_pre_norm(image_features)
+            img_feat_2d = img_normed.permute(0, 2, 1).view(B, C, hw, hw)
+
         embeddings = []
         if points is not None:
             coords, labels = points
-            embed = self.points_direct_project(coords)
-            embeddings.append(embed)
+            embeddings.append(self._encode_points(coords, labels, img_feat_2d))
         if boxes is not None:
-            embed = self.boxes_direct_project(boxes)
-            embeddings.append(embed)
+            B = boxes.shape[0]
+            box_labels = torch.ones(B, boxes.shape[1], dtype=torch.long, device=boxes.device)
+            embeddings.append(self._encode_boxes(boxes, box_labels, img_feat_2d))
         if not embeddings:
             return None
         geo = torch.cat(embeddings, dim=1)
         geo = self.norm(geo)
         if image_features is not None:
-            img = self.img_pre_norm(image_features)
             for layer in self.encode:
-                geo = layer(geo, torch.zeros_like(geo), img)
+                geo = layer(geo, torch.zeros_like(geo), image_features)
         geo = self.encode_norm(geo)
         return self.final_proj(geo)
 
@@ -290,7 +339,7 @@ class SegmentationHead(nn.Module):
     def __init__(self, d_model=256, num_heads=8, device=None, dtype=None, operations=None):
         super().__init__()
         self.d_model = d_model
-        self.pixel_decoder = PixelDecoder(d_model, 3, device=device, dtype=dtype, operations=operations)
+        self.pixel_decoder = PixelDecoder(d_model, 2, device=device, dtype=dtype, operations=operations)
         self.mask_predictor = MaskPredictor(d_model, device=device, dtype=dtype, operations=operations)
         self.cross_attend_prompt = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
         self.cross_attn_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -461,7 +510,7 @@ class SAM3Model(nn.Module):
                 tracker_features = tracker_features[:-self.detector.scalp]
                 tracker_positions = tracker_positions[:-self.detector.scalp]
 
-        high_res = [f for f in tracker_features[:-1]]
+        high_res = list(tracker_features[:-1])
         backbone_feat = tracker_features[-1]
         B, C, H, W = backbone_feat.shape
         # Add no-memory embedding (init frame path)

@@ -84,27 +84,18 @@ class SAM3_Detect(io.ComfyNode):
         dtype = model.model.get_dtype()
         sam3_model = model.model.diffusion_model
 
+        # Build point prompts as normalized (coords, labels) tuple for geometry encoder
+        points_tuple = None
         if has_points:
-            # Point prompts: use SAM interactive decoder (tracker path), per-image
-            all_coords = [[p["x"] / W * 1008, p["y"] / H * 1008] for p in pos_pts] + \
-                         [[p["x"] / W * 1008, p["y"] / H * 1008] for p in neg_pts]
+            all_coords = [[p["x"] / W, p["y"] / H] for p in pos_pts] + \
+                         [[p["x"] / W, p["y"] / H] for p in neg_pts]
             all_labels = [1] * len(pos_pts) + [0] * len(neg_pts)
-            point_inputs = {
-                "point_coords": torch.tensor([all_coords], dtype=dtype, device=device),
-                "point_labels": torch.tensor([all_labels], dtype=torch.int32, device=device),
-            }
-            all_masks = []
-            pbar = comfy.utils.ProgressBar(B)
-            for b in range(B):
-                frame = image_in[b:b+1].to(device=device, dtype=dtype)
-                mask_logits = sam3_model.forward_segment(frame, point_inputs=point_inputs)
-                mask = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
-                all_masks.append((mask[:, 0] > 0).float())
-                pbar.update(1)
-            mask_out = torch.cat(all_masks, dim=0)
-            return io.NodeOutput([[] for _ in range(B)], mask_out)
+            points_tuple = (
+                torch.tensor([all_coords], dtype=dtype, device=device),
+                torch.tensor([all_labels], dtype=torch.long, device=device),
+            )
 
-        # Text / box detection: run per-image to avoid OOM
+        # Run per-image through detector to avoid OOM
         if text_embeddings is not None:
             text_embeddings = text_embeddings.to(device=device, dtype=dtype)
         if text_mask is not None:
@@ -125,6 +116,7 @@ class SAM3_Detect(io.ComfyNode):
                 frame,
                 text_embeddings=text_embeddings,
                 text_mask=text_mask,
+                points=points_tuple,
                 boxes=b_boxes_tensor,
                 threshold=threshold,
                 orig_size=(H, W),

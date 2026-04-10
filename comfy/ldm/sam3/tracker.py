@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from comfy.ldm.modules.attention import optimized_attention
-from comfy.ldm.sam3.backbone import rope_2d, PositionEmbeddingSine
+from comfy.ldm.sam3.sam import rope_2d, PositionEmbeddingSine
 from comfy.ops import cast_to_input
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.cascade.common import LayerNorm2d_op
@@ -15,6 +15,11 @@ from comfy.ldm.sam3.sam import MLP, PositionEmbeddingRandom
 from comfy.ldm.sam3.sam import TwoWayTransformer as SAMTwoWayTransformer
 
 NO_OBJ_SCORE = -1024.0
+
+
+def to_spatial(x, H, W):
+    """Reshape (B, H*W, C) → (B, C, H, W)."""
+    return x.view(x.shape[0], H, W, -1).permute(0, 3, 1, 2)
 _PADDING_NUM = -1
 
 
@@ -78,11 +83,11 @@ def fill_holes_in_mask_scores(mask, max_area=0):
     fg = (mask > 0).float()
     # Opening (erode→dilate): removes small foreground sprinkles
     opened = _pool(-_pool(-fg))
-    mask = torch.where((fg > 0.5) & (opened < 0.5), torch.tensor(-0.1, device=mask.device, dtype=mask.dtype), mask)
+    mask = torch.where((fg > 0.5) & (opened < 0.5), -0.1, mask)
     # Closing (dilate→erode): fills small background holes
     fg = (mask > 0).float()
     closed = -_pool(-_pool(fg))
-    mask = torch.where((fg < 0.5) & (closed > 0.5), torch.tensor(0.1, device=mask.device, dtype=mask.dtype), mask)
+    mask = torch.where((fg < 0.5) & (closed > 0.5), 0.1, mask)
     return mask
 
 
@@ -305,24 +310,22 @@ class MemoryAttnLayer(nn.Module):
 
 
 class MemoryAttnEncoder(nn.Module):
-    def __init__(self, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, num_layers=4, device=None, dtype=None, operations=None):
+    def __init__(self, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, num_layers=4, image_size=1008, patch_size=14,
+                 device=None, dtype=None, operations=None):
         super().__init__()
         self.layers = nn.ModuleList([
             MemoryAttnLayer(d_model, num_heads, kv_dim, dim_ff, device=device, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        hw = image_size // patch_size
+        self.register_buffer("_rope", rope_2d(hw, hw, d_model // num_heads), persistent=False)
 
     def forward(self, x, memory, src_pos=None, memory_pos=None, num_k_exclude_rope=0):
         if src_pos is not None:
             x = x + 0.1 * src_pos
 
-        B, N, C = x.shape
-        hw = int(math.sqrt(N))
-        assert hw * hw == N, f"spatial dim {N} is not a perfect square"
-        num_heads = self.layers[0].num_heads
-        rope = rope_2d(hw, hw, C // num_heads).to(device=x.device)
-
+        rope = self._rope.to(device=x.device)
         for layer in self.layers:
             x = layer(x, memory, memory_pos=memory_pos, rope=rope, num_k_exclude_rope=num_k_exclude_rope)
         return self.norm(x)
@@ -332,6 +335,17 @@ class MemoryTransformer(nn.Module):
     def __init__(self, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, num_layers=4, device=None, dtype=None, operations=None):
         super().__init__()
         self.encoder = MemoryAttnEncoder(d_model, num_heads, kv_dim, dim_ff, num_layers, device=device, dtype=dtype, operations=operations)
+
+
+def _upscale_masks(output_upscaling, conv_s0, conv_s1, src_out, high_res_features):
+    """Shared upscaling for SAM mask decoders: deconv + high-res feature integration."""
+    dc1, ln1, act1, dc2, act2 = output_upscaling
+    if high_res_features is not None:
+        upscaled = act1(ln1(dc1(src_out) + conv_s1(high_res_features[1])))
+        upscaled = act2(dc2(upscaled) + conv_s0(high_res_features[0]))
+    else:
+        upscaled = act2(dc2(act1(ln1(dc1(src_out)))))
+    return upscaled
 
 
 class SAMMaskDecoder(nn.Module):
@@ -389,15 +403,7 @@ class SAMMaskDecoder(nn.Module):
         mask_tokens_out = hs[:, 2:2 + self.num_mask_tokens, :]
 
         src_out = src_out.permute(0, 2, 1).view(b, c, h, w)
-        # Upscale with high-res features projected and added before activation (matching reference)
-        dc1, ln1, act1, dc2, act2 = self.output_upscaling
-        if high_res_features is not None:
-            feat_s0 = self.conv_s0(high_res_features[0])  # [B, d_model//8, 4H, 4W]
-            feat_s1 = self.conv_s1(high_res_features[1])  # [B, d_model//4, 2H, 2W]
-            upscaled = act1(ln1(dc1(src_out) + feat_s1))
-            upscaled = act2(dc2(upscaled) + feat_s0)
-        else:
-            upscaled = act2(dc2(act1(ln1(dc1(src_out)))))
+        upscaled = _upscale_masks(self.output_upscaling, self.conv_s0, self.conv_s1, src_out, high_res_features)
 
         hyper_in = torch.stack([
             mlp(mask_tokens_out[:, i, :]) for i, mlp in enumerate(self.output_hypernetworks_mlps)
@@ -460,10 +466,8 @@ class SAMPromptEncoder(nn.Module):
                 coords = torch.cat([coords, torch.zeros(B, 1, 2, device=coords.device, dtype=coords.dtype)], dim=1)
                 labels = torch.cat([labels, -torch.ones(B, 1, device=labels.device, dtype=labels.dtype)], dim=1)
             pe = self.pe_layer.forward_with_coords(coords + 0.5, self.input_image_size)
-            pe[labels == 0] += cast_to_input(self.point_embeddings[0].weight, ref)
-            pe[labels == 1] += cast_to_input(self.point_embeddings[1].weight, ref)
-            pe[labels == 2] += cast_to_input(self.point_embeddings[2].weight, ref)
-            pe[labels == 3] += cast_to_input(self.point_embeddings[3].weight, ref)
+            for i in range(4):
+                pe[labels == i] += cast_to_input(self.point_embeddings[i].weight, ref)
             invalid = (labels == -1)
             pe[invalid] = 0.0
             pe[invalid] += cast_to_input(self.not_a_point_embed.weight, ref)
@@ -591,13 +595,16 @@ class DecoupledMemoryAttnLayer(nn.Module):
 class DecoupledMemoryEncoder(nn.Module):
     """Memory attention encoder for SAM3.1 with decoupled cross-attention."""
 
-    def __init__(self, d_model=256, num_heads=1, dim_ff=2048, num_layers=4, device=None, dtype=None, operations=None):
+    def __init__(self, d_model=256, num_heads=1, dim_ff=2048, num_layers=4, image_size=1008, patch_size=14,
+                 device=None, dtype=None, operations=None):
         super().__init__()
         self.layers = nn.ModuleList([
             DecoupledMemoryAttnLayer(d_model, num_heads, dim_ff, device=device, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        hw = image_size // patch_size
+        self.register_buffer("_rope", rope_2d(hw, hw, d_model // num_heads), persistent=False)
 
     def forward(self, x, memory, memory_pos=None, src_pos=None, num_k_exclude_rope=0,
                 memory_image=None, memory_image_pos=None):
@@ -606,11 +613,8 @@ class DecoupledMemoryEncoder(nn.Module):
         if src_pos is not None:
             output = output + 0.1 * src_pos
 
-        B, N, C = x.shape
-        hw = int(math.sqrt(N))
-        assert hw * hw == N, f"spatial dim {N} is not a perfect square"
-        num_heads = self.layers[0].num_heads
-        rope = rope_2d(hw, hw, C // num_heads).to(device=x.device)
+        B, _, C = x.shape
+        rope = self._rope.to(device=x.device)
 
         # memory_image: raw backbone features from past frames for decoupled cross-attention
         if memory_image is None:
@@ -744,16 +748,8 @@ class MultiplexMaskDecoder(nn.Module):
         iou_token_out = hs[:, M:2 * M]
         mask_tokens_out = hs[:, 2 * M:2 * M + M * T]
 
-        # Upscale with high-res features projected and added before activation (matching reference)
         src_out = src_out.permute(0, 2, 1).view(b, c, h, w)
-        dc1, ln1, act1, dc2, act2 = self.output_upscaling
-        if high_res_features is not None:
-            feat_s0 = self.conv_s0(high_res_features[0])
-            feat_s1 = self.conv_s1(high_res_features[1])
-            upscaled = act1(ln1(dc1(src_out) + feat_s1))
-            upscaled = act2(dc2(upscaled) + feat_s0)
-        else:
-            upscaled = act2(dc2(act1(ln1(dc1(src_out)))))
+        upscaled = _upscale_masks(self.output_upscaling, self.conv_s0, self.conv_s1, src_out, high_res_features)
 
         # Reshape mask tokens to [B, M, T, C] and apply shared hypernetwork MLPs per mask output index
         mask_tokens_2d = mask_tokens_out.view(B, M, T, -1)
@@ -846,7 +842,7 @@ class SAM3Tracker(nn.Module):
         if is_init_cond_frame:
             # First conditioning frame: no memory yet, add no_mem_embed
             pix_feat = current_vision_feats[-1] + cast_to_input(self.no_mem_embed, current_vision_feats[-1])
-            return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
+            return to_spatial(pix_feat, H, W)
 
         to_cat_memory, to_cat_memory_pos, _, _, cond_outputs = collect_memory_tokens(
             output_dict, frame_idx, self.num_maskmem, self.maskmem_tpos_enc, device)
@@ -890,7 +886,7 @@ class SAM3Tracker(nn.Module):
         if len(to_cat_memory) == 0:
             # No memory available yet, add no_mem_embed
             pix_feat = current_vision_feats[-1] + cast_to_input(self.no_mem_embed, current_vision_feats[-1])
-            return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
+            return to_spatial(pix_feat, H, W)
 
         # Concatenate all memory and position encodings [B, total_mem, mem_dim=64]
         memory = torch.cat(to_cat_memory, dim=1)
@@ -907,7 +903,7 @@ class SAM3Tracker(nn.Module):
             memory_pos=memory_pos,
             num_k_exclude_rope=num_obj_ptr_tokens,
         )
-        return pix_feat_with_mem.view(B, H, W, C).permute(0, 3, 1, 2)
+        return to_spatial(pix_feat_with_mem, H, W)
 
     def _encode_new_memory(self, pix_feat, pred_masks_high_res, object_score_logits, is_mask_from_pts=False):
         """Encode predicted mask into memory features."""
@@ -942,13 +938,11 @@ class SAM3Tracker(nn.Module):
             high_res_features = None
 
         # Top-level feature for memory
-        B = current_vision_feats[-1].shape[0]
-        C = self.d_model
         H, W = feat_sizes[-1]
 
         if mask_inputs is not None:
             # Conditioning frame: use mask directly
-            pix_feat = current_vision_feats[-1].view(B, H, W, C).permute(0, 3, 1, 2)
+            pix_feat = to_spatial(current_vision_feats[-1], H, W)
             sam_outputs = self._use_mask_as_output(pix_feat, high_res_features, mask_inputs)
         else:
             # Track frame: fuse with memory, then SAM decoder
@@ -984,7 +978,7 @@ class SAM3Tracker(nn.Module):
 
         # Encode memory
         if self.num_maskmem > 0:
-            pix_feat = current_vision_feats[-1].view(B, H, W, C).permute(0, 3, 1, 2)
+            pix_feat = to_spatial(current_vision_feats[-1], H, W)
             maskmem_features, maskmem_pos_enc = self._encode_new_memory(
                 pix_feat=pix_feat,
                 pred_masks_high_res=high_res_masks,
@@ -1154,7 +1148,7 @@ class SAM31Tracker(nn.Module):
 
         if is_init_cond_frame:
             pix_feat = current_vision_feats[-1] + cast_to_input(self.interactivity_no_mem_embed, current_vision_feats[-1])
-            return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
+            return to_spatial(pix_feat, H, W)
 
         to_cat_memory, to_cat_memory_pos, to_cat_image_feat, to_cat_image_pos, cond_outputs = collect_memory_tokens(
             output_dict, frame_idx, self.num_maskmem, self.maskmem_tpos_enc, device, collect_image_feats=True)
@@ -1188,7 +1182,7 @@ class SAM31Tracker(nn.Module):
 
         if len(to_cat_memory) == 0:
             pix_feat = current_vision_feats[-1] + cast_to_input(self.interactivity_no_mem_embed, current_vision_feats[-1])
-            return pix_feat.view(B, H, W, C).permute(0, 3, 1, 2)
+            return to_spatial(pix_feat, H, W)
 
         memory = torch.cat(to_cat_memory, dim=1)
         memory_pos = torch.cat(to_cat_memory_pos, dim=1)
@@ -1216,7 +1210,7 @@ class SAM31Tracker(nn.Module):
                 src_pos=current_vision_pos_embeds[-1],
                 num_k_exclude_rope=num_obj_ptr_tokens,
             )
-        return pix_feat_with_mem.view(B, H, W, C).permute(0, 3, 1, 2)
+        return to_spatial(pix_feat_with_mem, H, W)
 
     def _encode_new_memory(self, pix_feat, pred_masks_high_res, object_score_logits, is_mask_from_pts=False,
                            multiplex_state=None, is_conditioning=False):
@@ -1304,8 +1298,6 @@ class SAM31Tracker(nn.Module):
                    interactive_high_res=None, interactive_backbone=None, propagation_high_res=None,
                    multiplex_state=None):
         current_out = {}
-        B = current_vision_feats[-1].shape[0]
-        C = self.d_model
         H, W = feat_sizes[-1]
 
         if mask_inputs is not None:
@@ -1315,12 +1307,12 @@ class SAM31Tracker(nn.Module):
                 # Add no_mem_embed for interactive path
                 pix_flat = pix_feat.flatten(2)
                 bf = pix_flat.permute(0, 2, 1) + cast_to_input(self.interactivity_no_mem_embed, pix_flat)
-                pix_feat = bf.view(B, H, W, C).permute(0, 3, 1, 2)
+                pix_feat = to_spatial(bf, H, W)
                 hi_res = interactive_high_res
             else:
                 # Fallback: interactive backbone not available (e.g. called outside track_video).
                 # Propagation features work but may produce lower-quality conditioning.
-                pix_feat = current_vision_feats[-1].view(B, H, W, C).permute(0, 3, 1, 2)
+                pix_feat = to_spatial(current_vision_feats[-1], H, W)
                 hi_res = propagation_high_res
             sam_outputs = self._use_mask_as_output(pix_feat, hi_res, mask_inputs)
         elif point_inputs is not None:
@@ -1355,7 +1347,7 @@ class SAM31Tracker(nn.Module):
 
         # Encode memory from raw masks (before cleanup)
         if self.num_maskmem > 0:
-            pix_feat = current_vision_feats[-1].view(B, H, W, C).permute(0, 3, 1, 2)
+            pix_feat = to_spatial(current_vision_feats[-1], H, W)
             maskmem_features, maskmem_pos_enc = self._encode_new_memory(
                 pix_feat=pix_feat, pred_masks_high_res=high_res_masks,
                 object_score_logits=object_score_logits,
