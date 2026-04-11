@@ -21,8 +21,6 @@ NO_OBJ_SCORE = -1024.0
 def to_spatial(x, H, W):
     """Reshape (B, H*W, C) → (B, C, H, W)."""
     return x.view(x.shape[0], H, W, -1).permute(0, 3, 1, 2)
-_PADDING_NUM = -1
-
 
 class MultiplexState:
     """Tracks object-to-slot assignments for multiplex tracking. Provides mux/demux operations."""
@@ -32,29 +30,14 @@ class MultiplexState:
         self.num_buckets = (num_objects + multiplex_count - 1) // multiplex_count
         self.total_valid_entries = num_objects
 
-        # Build assignments: pack objects sequentially into buckets
-        assignments = []
-        obj_idx = 0
-        for _ in range(self.num_buckets):
-            bucket = []
-            for _ in range(multiplex_count):
-                if obj_idx < num_objects:
-                    bucket.append(obj_idx)
-                    obj_idx += 1
-                else:
-                    bucket.append(_PADDING_NUM)
-            assignments.append(bucket)
-
         # Precompute mux/demux matrices
         total_slots = self.num_buckets * multiplex_count
         self.mux_matrix = torch.zeros(total_slots, num_objects, device=device, dtype=dtype)
         self.demux_matrix = torch.zeros(num_objects, total_slots, device=device, dtype=dtype)
-        for i, bucket in enumerate(assignments):
-            for j, oid in enumerate(bucket):
-                if oid >= 0:
-                    slot = i * multiplex_count + j
-                    self.mux_matrix[slot, oid] = 1.0
-                    self.demux_matrix[oid, slot] = 1.0
+        for oid in range(num_objects):
+            slot = (oid // multiplex_count) * multiplex_count + (oid % multiplex_count)
+            self.mux_matrix[slot, oid] = 1.0
+            self.demux_matrix[oid, slot] = 1.0
 
     def mux(self, x):
         """[N_obj, ...] -> [num_buckets, multiplex_count, ...]"""
@@ -1295,15 +1278,6 @@ class SAM31Tracker(nn.Module):
         per_slot_no_obj = ((1 - alpha) * no_obj_spatial).sum(dim=1)  # [num_buckets, C, 1, 1]
         maskmem_features = maskmem_features + per_slot_no_obj.expand_as(maskmem_features)
 
-        # Demux from [num_buckets, C, H, W] back to per-object [N_obj, C, H, W]
-        if maskmem_features.dim() == 5:
-            maskmem_features = multiplex_state.demux(maskmem_features).contiguous()
-        if isinstance(maskmem_pos_enc, (list, tuple)):
-            maskmem_pos_enc = [multiplex_state.demux(p).contiguous() if p is not None and p.dim() == 5 else p
-                               for p in maskmem_pos_enc]
-        elif maskmem_pos_enc is not None and maskmem_pos_enc.dim() == 5:
-            maskmem_pos_enc = multiplex_state.demux(maskmem_pos_enc).contiguous()
-
         return maskmem_features, maskmem_pos_enc
 
     def _forward_propagation(self, backbone_features, high_res_features=None, multiplex_state=None):
@@ -1504,9 +1478,9 @@ class SAM31Tracker(nn.Module):
                                           mode="bilinear", align_corners=False)
 
                 # Keep only largest connected component (prevents drift noise in memory and output)
-                mem_masks = _keep_largest_component(mem_masks)
-                current_out["pred_masks_high_res"] = _keep_largest_component(
-                    current_out["pred_masks_high_res"])
+                # mem_masks = _keep_largest_component(mem_masks)
+                # current_out["pred_masks_high_res"] = _keep_largest_component(
+                #     current_out["pred_masks_high_res"])
 
                 obj_scores = torch.where(
                     (mem_masks > 0).any(dim=(-1, -2)), 10.0, -10.0)
