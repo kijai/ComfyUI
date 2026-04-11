@@ -393,8 +393,19 @@ class SAM3VisionBackbone(nn.Module):
             self.convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
             self.sam2_convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
 
-    def forward(self, images, need_tracker=False, tracker_mode=None, cached_trunk=None):
+    def forward(self, images, need_tracker=False, tracker_mode=None, cached_trunk=None, tracker_only=False):
         backbone_out = cached_trunk if cached_trunk is not None else self.trunk(images)
+
+        if tracker_only:
+            # Skip detector FPN when only tracker features are needed (video tracking)
+            if self.multiplex:
+                tracker_convs = self.propagation_convs if tracker_mode == "propagation" else self.interactive_convs
+            else:
+                tracker_convs = self.sam2_convs
+            tracker_features = [conv(backbone_out) for conv in tracker_convs]
+            tracker_positions = [cast_to_input(self.position_encoding(f), f) for f in tracker_features]
+            return None, None, tracker_features, tracker_positions
+
         features = [conv(backbone_out) for conv in self.convs]
         positions = [cast_to_input(self.position_encoding(f), f) for f in features]
 

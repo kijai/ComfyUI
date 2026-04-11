@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import roi_align
 
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.sam3.tracker import SAM3Tracker, SAM31Tracker
@@ -269,8 +270,7 @@ class GeometryEncoder(nn.Module):
         boxes_xyxy = box_cxcywh_to_xyxy(boxes)
         scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype, device=boxes_xyxy.device)
         boxes_scaled = boxes_xyxy * scale
-        import torchvision.ops
-        sampled = torchvision.ops.roi_align(img_feat_2d, boxes_scaled.view(-1, 4).split(N), self.roi_size)
+        sampled = roi_align(img_feat_2d, boxes_scaled.view(-1, 4).split(N), self.roi_size)
         proj = self.boxes_pool_project(sampled).view(B, N, -1)  # Conv2d(roi_size) -> [B*N, C, 1, 1] -> [B, N, C]
         embed = embed + proj
         # Positional encoding of box center + size
@@ -423,8 +423,7 @@ class SAM3Detector(nn.Module):
 
     def forward(self, images, text_embeddings=None, text_mask=None, points=None, boxes=None, threshold=0.3, orig_size=None):
         B = images.shape[0]
-        features, positions, tracker_features, tracker_positions = self._get_backbone_features(images)
-        self._cached_tracker_features = (tracker_features, tracker_positions)
+        features, positions, _, _ = self._get_backbone_features(images)
 
         if text_embeddings is not None:
             text_embeddings = self.backbone["language_backbone"]["resizer"](text_embeddings)
@@ -492,12 +491,14 @@ class SAM3Model(nn.Module):
     def forward(self, images, **kwargs):
         return self.detector(images, **kwargs)
 
-    def forward_segment(self, images, point_inputs=None):
-        """Interactive segmentation using SAM decoder with point prompts.
+    def forward_segment(self, images, point_inputs=None, box_inputs=None, mask_inputs=None):
+        """Interactive segmentation using SAM decoder with point/box/mask prompts.
 
         Args:
             images: [B, 3, 1008, 1008] preprocessed images
             point_inputs: {"point_coords": [B, N, 2], "point_labels": [B, N]} in 1008x1008 pixel space
+            box_inputs: [B, 2, 2] box corners (top-left, bottom-right) in 1008x1008 pixel space
+            mask_inputs: [B, 1, H, W] coarse mask logits to refine
         Returns:
             [B, 1, image_size, image_size] high-res mask logits
         """
@@ -526,6 +527,8 @@ class SAM3Model(nn.Module):
         _, high_res_masks, _, _ = self.tracker._forward_sam_heads(
             backbone_features=backbone_feat,
             point_inputs=point_inputs,
+            mask_inputs=mask_inputs,
+            box_inputs=box_inputs,
             high_res_features=high_res,
             multimask_output=(0 < num_pts <= 1),
         )
@@ -533,11 +536,11 @@ class SAM3Model(nn.Module):
 
     def forward_video(self, images, initial_masks, pbar=None):
         bb = self.detector.backbone["vision_backbone"]
-        def backbone_fn(frame):
+        def backbone_fn(frame, frame_idx=None):  # noqa: frame_idx unused, passed by tracker
             trunk_out = bb.trunk(frame)
             if bb.multiplex:
-                _, _, tf, tp = bb(frame, tracker_mode="propagation", cached_trunk=trunk_out)
+                _, _, tf, tp = bb(frame, tracker_mode="propagation", cached_trunk=trunk_out, tracker_only=True)
             else:
-                _, _, tf, tp = bb(frame, need_tracker=True, cached_trunk=trunk_out)
+                _, _, tf, tp = bb(frame, need_tracker=True, cached_trunk=trunk_out, tracker_only=True)
             return tf, tp, trunk_out
         return self.tracker.track_video(backbone_fn, images, initial_masks, pbar=pbar, backbone_obj=bb)
