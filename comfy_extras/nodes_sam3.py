@@ -12,6 +12,29 @@ import comfy.utils
 from comfy_api.latest import ComfyExtension, io
 
 
+def _extract_text_prompts(conditioning, device, dtype):
+    """Extract list of (text_embeddings, text_mask) from conditioning."""
+    cond_meta = conditioning[0][1]
+    multi = cond_meta.get("sam3_multi_cond")
+    prompts = []
+    if multi is not None:
+        for entry in multi:
+            emb = entry["cond"].to(device=device, dtype=dtype)
+            mask = entry["attention_mask"].to(device) if entry["attention_mask"] is not None else None
+            if mask is None:
+                mask = torch.ones(emb.shape[0], emb.shape[1], dtype=torch.int64, device=device)
+            prompts.append((emb, mask, entry.get("max_detections", 1)))
+    else:
+        emb = conditioning[0][0].to(device=device, dtype=dtype)
+        mask = cond_meta.get("attention_mask")
+        if mask is not None:
+            mask = mask.to(device)
+        else:
+            mask = torch.ones(emb.shape[0], emb.shape[1], dtype=torch.int64, device=device)
+        prompts.append((emb, mask, 1))
+    return prompts
+
+
 def _refine_mask(sam3_model, orig_image_hwc, coarse_mask, box_xyxy, H, W, device, dtype, iterations):
     """Refine a coarse detector mask via SAM decoder, cropping to the detection box.
 
@@ -71,6 +94,7 @@ class SAM3_Detect(io.ComfyNode):
                 io.String.Input("negative_coords", display_name="negative_coords", force_input=True, optional=True, tooltip="Negative point prompts as JSON [{\"x\": int, \"y\": int}, ...] (pixel coords)"),
                 io.Float.Input("threshold", display_name="threshold", default=0.5, min=0.0, max=1.0, step=0.01),
                 io.Int.Input("refine_iterations", display_name="refine_iterations", default=2, min=0, max=5, tooltip="SAM decoder refinement passes (0=use raw detector masks)"),
+                io.Boolean.Input("individual_masks", display_name="individual_masks", default=False, tooltip="Output per-object masks instead of union"),
             ],
             outputs=[
                 io.Mask.Output("masks"),
@@ -79,7 +103,7 @@ class SAM3_Detect(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, image, conditioning=None, bboxes=None, positive_coords=None, negative_coords=None, threshold=0.5, refine_iterations=2) -> io.NodeOutput:
+    def execute(cls, model, image, conditioning=None, bboxes=None, positive_coords=None, negative_coords=None, threshold=0.5, refine_iterations=2, individual_masks=False) -> io.NodeOutput:
         B, H, W, C = image.shape
 
         image_in = comfy.utils.common_upscale(image.movedim(-1, 1), 1008, 1008, "bilinear", crop="disabled")
@@ -126,27 +150,7 @@ class SAM3_Detect(io.ComfyNode):
                 "point_labels": torch.tensor([all_labels], dtype=torch.int32, device=device),
             }
 
-        # Build per-prompt list: [(cond_tensor, attention_mask, max_detections), ...]
-        # SAM3 CLIP packs comma-separated prompts with per-prompt max_detections in metadata
-        cond_list = []
-        if conditioning is not None and len(conditioning) > 0:
-            cond_meta = conditioning[0][1]
-            multi = cond_meta.get("sam3_multi_cond")
-            if multi is not None:
-                for entry in multi:
-                    cond_list.append((
-                        entry["cond"].to(device=device, dtype=dtype),
-                        entry["attention_mask"].to(device) if entry["attention_mask"] is not None else None,
-                        entry["max_detections"],
-                    ))
-            else:
-                cond_tensor = conditioning[0][0].to(device=device, dtype=dtype)
-                attn_mask = cond_meta.get("attention_mask")
-                if attn_mask is not None:
-                    attn_mask = attn_mask.to(device)
-                else:
-                    attn_mask = torch.ones(cond_tensor.shape[0], cond_tensor.shape[1], dtype=torch.int64, device=device)
-                cond_list.append((cond_tensor, attn_mask, 1))
+        cond_list = _extract_text_prompts(conditioning, device, dtype) if conditioning is not None and len(conditioning) > 0 else []
         has_text = len(cond_list) > 0
 
         # Run per-image through detector (text/boxes) and/or tracker (points)
@@ -232,14 +236,59 @@ class SAM3_Detect(io.ComfyNode):
 
             all_bbox_dicts.append(frame_bbox_dicts)
             if len(frame_masks) > 0:
-                combined = torch.cat(frame_masks, dim=0)
-                all_masks.append((combined > 0).any(dim=0).float())
+                combined = torch.cat(frame_masks, dim=0)  # [N_obj, H, W]
+                if individual_masks:
+                    all_masks.append(combined)
+                else:
+                    all_masks.append((combined > 0).any(dim=0).float())
             else:
                 all_masks.append(torch.zeros(H, W, device=comfy.model_management.intermediate_device()))
             pbar.update(1)
 
-        mask_out = torch.stack(all_masks)
+        mask_out = torch.cat(all_masks, dim=0) if individual_masks else torch.stack(all_masks)
         return io.NodeOutput(mask_out, all_bbox_dicts)
+
+
+SAM3TrackData = io.Custom("SAM3_TRACK_DATA")
+
+# 5x3 bitmap font for digits 0-9 (each digit is 5 rows of 3-bit patterns)
+_DIGIT_BITMAPS = [
+    [7,5,5,5,7], [2,6,2,2,7], [7,1,7,4,7], [7,1,7,1,7], [5,5,7,1,1],
+    [7,4,7,1,7], [7,4,7,5,7], [7,1,1,1,1], [7,5,7,5,7], [7,5,7,1,7],
+]
+
+def _draw_number(img, number, cx, cy, color, scale=3):
+    """Draw a number on a numpy image [H, W, 3] at (cx, cy) with colored text and dark outline."""
+    H, W = img.shape[:2]
+    digits = str(number)
+    total_w = len(digits) * 4 * scale - scale
+    x0 = cx - total_w // 2
+    y0 = cy - 5 * scale // 2
+    outline_pts, fill_pts = [], []
+    for di, ch in enumerate(digits):
+        bm = _DIGIT_BITMAPS[int(ch)]
+        dx = x0 + di * 4 * scale
+        for row in range(5):
+            for col in range(3):
+                if not (bm[row] & (4 >> col)):
+                    continue
+                for sy in range(scale):
+                    for sx in range(scale):
+                        py = y0 + row * scale + sy
+                        px = dx + col * scale + sx
+                        for oy in range(-1, 2):
+                            for ox in range(-1, 2):
+                                yy, xx = py + oy, px + ox
+                                if 0 <= yy < H and 0 <= xx < W:
+                                    outline_pts.append((yy, xx))
+                        if 0 <= py < H and 0 <= px < W:
+                            fill_pts.append((py, px))
+    rgb = [int(c * 255) for c in color]
+    for y, x in outline_pts:
+        img[y, x] = [0, 0, 0]
+    for y, x in fill_pts:
+        img[y, x] = rgb
+
 
 
 class SAM3_VideoTrack(io.ComfyNode):
@@ -255,15 +304,19 @@ class SAM3_VideoTrack(io.ComfyNode):
             inputs=[
                 io.Image.Input("images", display_name="images", tooltip="Video frames as batched images"),
                 io.Model.Input("model", display_name="model"),
-                io.Mask.Input("initial_mask", display_name="initial_mask", tooltip="Mask(s) for the first frame to track (one per object)"),
+                io.Mask.Input("initial_mask", display_name="initial_mask", optional=True, tooltip="Mask(s) for the first frame to track (one per object)"),
+                io.Conditioning.Input("conditioning", display_name="conditioning", optional=True, tooltip="Text conditioning for detecting new objects during tracking"),
+                io.Float.Input("detection_threshold", display_name="detection_threshold", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="Score threshold for text-prompted detection"),
+                io.Int.Input("max_objects", display_name="max_objects", default=0, min=0, tooltip="Max tracked objects (0=unlimited). Initial masks count toward this limit."),
+                io.Int.Input("detect_interval", display_name="detect_interval", default=1, min=1, tooltip="Run detection every N frames (1=every frame). Higher values save compute."),
             ],
             outputs=[
-                io.Mask.Output("masks", display_name="masks"),
+                SAM3TrackData.Output("track_data", display_name="track_data"),
             ],
         )
 
     @classmethod
-    def execute(cls, images, model, initial_mask) -> io.NodeOutput:
+    def execute(cls, images, model, initial_mask=None, conditioning=None, detection_threshold=0.5, max_objects=0, detect_interval=1) -> io.NodeOutput:
         N, H, W, C = images.shape
 
         comfy.model_management.load_model_gpu(model)
@@ -273,27 +326,143 @@ class SAM3_VideoTrack(io.ComfyNode):
 
         frames = images.movedim(-1, 1)
         frames_in = comfy.utils.common_upscale(frames, 1008, 1008, "bilinear", crop="disabled").to(device=device, dtype=dtype)
-        # initial_mask: [N_obj, H, W] — one mask per object to track
-        init_masks = initial_mask.unsqueeze(1).to(device=device, dtype=dtype)  # [N_obj, 1, H, W]
+
+        init_masks = None
+        if initial_mask is not None:
+            init_masks = initial_mask.unsqueeze(1).to(device=device, dtype=dtype)
 
         pbar = comfy.utils.ProgressBar(N)
-        mask_logits = sam3_model.forward_video(images=frames_in, initial_masks=init_masks, pbar=pbar)
-        # mask_logits: [N, N_obj, image_size, image_size]
 
-        mask_out = F.interpolate(mask_logits, size=(H, W), mode="bilinear", align_corners=False)
-        # Apply non-overlapping constraints for multi-object (matching reference _postprocess_output)
-        N_obj = mask_out.shape[1]
-        if N_obj > 1:
-            for t in range(mask_out.shape[0]):
-                obj_masks = mask_out[t]  # [N_obj, H, W]
-                # At each pixel, only the highest-scoring object keeps positive logits
-                max_obj = torch.argmax(obj_masks, dim=0, keepdim=True)  # [1, H, W]
-                batch_inds = torch.arange(N_obj, device=obj_masks.device)[:, None, None]
+        text_prompts = None
+        if conditioning is not None:
+            text_prompts = [(emb, mask) for emb, mask, _ in _extract_text_prompts(conditioning, device, dtype)]
+        elif initial_mask is None:
+            raise ValueError("Either initial_mask or conditioning must be provided")
+
+        mask_logits = sam3_model.forward_video(
+            images=frames_in, initial_masks=init_masks, pbar=pbar, text_prompts=text_prompts,
+            new_det_thresh=detection_threshold, max_objects=max_objects, detect_interval=detect_interval)
+
+        # mask_logits: [N, N_obj, 1008, 1008] on intermediate device
+        return io.NodeOutput({"logits": mask_logits, "orig_size": (H, W)})
+
+
+class SAM3_TrackPreview(io.ComfyNode):
+    """Visualize tracked objects with distinct colors overlaid on video frames."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SAM3_TrackPreview",
+            display_name="SAM3 Track Preview",
+            category="detection/",
+            inputs=[
+                SAM3TrackData.Input("track_data", display_name="track_data"),
+                io.Image.Input("images", display_name="images", optional=True),
+                io.Float.Input("opacity", display_name="opacity", default=0.5, min=0.0, max=1.0, step=0.05),
+            ],
+            outputs=[
+                io.Image.Output("preview", display_name="preview"),
+            ],
+        )
+
+    COLORS = [
+        (0.12, 0.47, 0.71), (1.0, 0.5, 0.05), (0.17, 0.63, 0.17), (0.84, 0.15, 0.16),
+        (0.58, 0.4, 0.74), (0.55, 0.34, 0.29), (0.89, 0.47, 0.76), (0.5, 0.5, 0.5),
+        (0.74, 0.74, 0.13), (0.09, 0.75, 0.81), (0.94, 0.76, 0.06), (0.42, 0.68, 0.84),
+    ]
+
+    @classmethod
+    def execute(cls, track_data, images=None, opacity=0.5) -> io.NodeOutput:
+        logits = track_data["logits"]  # [N, N_obj, H_model, W_model]
+        N, N_obj = logits.shape[:2]
+        H, W = track_data["orig_size"]
+
+        if images is not None:
+            H, W = images.shape[1], images.shape[2]
+            preview = images.clone()
+        else:
+            preview = torch.zeros(N, H, W, 3)
+
+        if N_obj == 0:
+            return io.NodeOutput(preview)
+
+        masks = F.interpolate(logits.float(), size=(H, W), mode="bilinear", align_corners=False)
+
+        for obj_idx in range(N_obj):
+            r, g, b = cls.COLORS[obj_idx % len(cls.COLORS)]
+            color = torch.tensor([r, g, b], device=preview.device, dtype=preview.dtype)
+            obj_mask = (masks[:, obj_idx] > 0).float()  # [N, H, W]
+            alpha = (obj_mask * opacity).unsqueeze(-1)  # [N, H, W, 1]
+            preview = preview * (1 - alpha) + color * alpha
+
+        # Draw object index numbers at mask centroids
+        preview_np = (preview * 255).clamp(0, 255).byte().cpu().numpy()
+        for t in range(N):
+            for obj_idx in range(N_obj):
+                m = masks[t, obj_idx] > 0
+                if not m.any():
+                    continue
+                ys, xs = torch.where(m)
+                cy, cx = int(ys.float().mean()), int(xs.float().mean())
+                _draw_number(preview_np[t], obj_idx, cx, cy, cls.COLORS[obj_idx % len(cls.COLORS)])
+        preview = torch.from_numpy(preview_np).float().div(255).to(device=preview.device)
+
+        return io.NodeOutput(preview)
+
+
+class SAM3_TrackToMask(io.ComfyNode):
+    """Select tracked objects by index and output as mask."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SAM3_TrackToMask",
+            display_name="SAM3 Track to Mask",
+            category="detection/",
+            inputs=[
+                SAM3TrackData.Input("track_data", display_name="track_data"),
+                io.String.Input("object_indices", display_name="object_indices", default="",
+                                tooltip="Comma-separated object indices to include (e.g. '0,2,3'). Empty = all objects."),
+            ],
+            outputs=[
+                io.Mask.Output("masks", display_name="masks"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, track_data, object_indices="") -> io.NodeOutput:
+        logits = track_data["logits"]  # [N, N_obj, H_model, W_model]
+        H, W = track_data["orig_size"]
+        N, N_obj = logits.shape[:2]
+
+        if N_obj == 0:
+            return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
+
+        # Parse object indices
+        if object_indices.strip():
+            indices = [int(i.strip()) for i in object_indices.split(",") if i.strip().isdigit()]
+            indices = [i for i in indices if 0 <= i < N_obj]
+        else:
+            indices = list(range(N_obj))
+
+        if not indices:
+            return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
+
+        selected = logits[:, indices]  # [N, len(indices), H_model, W_model]
+
+        # Non-overlapping suppression at model resolution
+        if len(indices) > 1:
+            for t in range(N):
+                obj_masks = selected[t]
+                max_obj = torch.argmax(obj_masks, dim=0, keepdim=True)
+                batch_inds = torch.arange(len(indices), device=obj_masks.device)[:, None, None]
                 keep = (max_obj == batch_inds)
-                mask_out[t] = torch.where(keep, obj_masks, torch.clamp(obj_masks, max=-10.0))
-        # Union all objects per frame → [N, H, W]
-        mask_out = (mask_out.amax(dim=1) > -1.0).float()
+                selected[t] = torch.where(keep, obj_masks, torch.clamp(obj_masks, max=-10.0))
 
+        # Union + upscale
+        mask_out = (selected.amax(dim=1, keepdim=True) > -1.0).float()
+        mask_out = F.interpolate(mask_out, size=(H, W), mode="bilinear", align_corners=False)[:, 0]
         return io.NodeOutput(mask_out)
 
 
@@ -303,6 +472,8 @@ class SAM3Extension(ComfyExtension):
         return [
             SAM3_Detect,
             SAM3_VideoTrack,
+            SAM3_TrackPreview,
+            SAM3_TrackToMask,
         ]
 
 

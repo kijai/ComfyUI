@@ -421,21 +421,15 @@ class SAM3Detector(nn.Module):
         x = x + layer.linear2(F.relu(layer.linear1(layer.norm3(x))))
         return x
 
-    def forward(self, images, text_embeddings=None, text_mask=None, points=None, boxes=None, threshold=0.3, orig_size=None):
-        B = images.shape[0]
-        features, positions, _, _ = self._get_backbone_features(images)
-
-        if text_embeddings is not None:
-            text_embeddings = self.backbone["language_backbone"]["resizer"](text_embeddings)
-            if text_mask is not None:
-                text_mask = text_mask.bool()
-
+    def _detect(self, features, positions, text_embeddings=None, text_mask=None,
+                points=None, boxes=None):
+        """Shared detection: geometry encoding, transformer, scoring, segmentation."""
+        B = features[0].shape[0]
         enc_feat, enc_pos = features[-1], positions[-1]
         _, _, H, W = enc_feat.shape
         img_flat = enc_feat.flatten(2).permute(0, 2, 1)
         pos_flat = enc_pos.flatten(2).permute(0, 2, 1)
 
-        # Build prompt tokens: text + geometry + cls
         has_prompts = text_embeddings is not None or points is not None or boxes is not None
         if has_prompts:
             geo_enc = self.geometry_encoder
@@ -455,6 +449,7 @@ class SAM3Detector(nn.Module):
                 text_mask = torch.cat([text_mask, torch.ones(B, n_new, dtype=torch.bool, device=text_mask.device)], dim=1)
             else:
                 text_mask = torch.ones(B, text_embeddings.shape[1], dtype=torch.bool, device=text_embeddings.device)
+
         memory = self.transformer.encoder(img_flat, pos_flat, text_embeddings, text_mask)
         dec_out = self.transformer.decoder(memory, pos_flat, text_embeddings, text_mask, H, W)
         query_out, pred_boxes = dec_out["decoder_output"], dec_out["pred_boxes"]
@@ -465,8 +460,19 @@ class SAM3Detector(nn.Module):
             scores = torch.zeros(B, query_out.shape[1], device=query_out.device)
 
         masks = self.segmentation_head(query_out, features, encoder_hidden_states=memory, prompt=text_embeddings, prompt_mask=text_mask)
+        return box_cxcywh_to_xyxy(pred_boxes), scores, masks, dec_out
 
-        boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes)
+    def forward(self, images, text_embeddings=None, text_mask=None, points=None, boxes=None, threshold=0.3, orig_size=None):
+        features, positions, _, _ = self._get_backbone_features(images)
+
+        if text_embeddings is not None:
+            text_embeddings = self.backbone["language_backbone"]["resizer"](text_embeddings)
+            if text_mask is not None:
+                text_mask = text_mask.bool()
+
+        boxes_xyxy, scores, masks, dec_out = self._detect(
+            features, positions, text_embeddings, text_mask, points, boxes)
+
         if orig_size is not None:
             oh, ow = orig_size
             boxes_xyxy = boxes_xyxy * torch.tensor([ow, oh, ow, oh], device=boxes_xyxy.device, dtype=boxes_xyxy.dtype)
@@ -478,6 +484,25 @@ class SAM3Detector(nn.Module):
             "masks": masks,
             "presence": dec_out.get("presence"),
         }
+
+    def forward_from_trunk(self, trunk_out, text_embeddings, text_mask):
+        """Run detection using a pre-computed ViTDet trunk output.
+
+        text_embeddings must already be resized through language_backbone.resizer.
+        Returns dict with boxes (normalized xyxy), scores, masks at detector resolution.
+        """
+        bb = self.backbone["vision_backbone"]
+        features = [conv(trunk_out) for conv in bb.convs]
+        positions = [cast_to_input(bb.position_encoding(f), f) for f in features]
+        if self.scalp > 0:
+            features, positions = features[:-self.scalp], positions[:-self.scalp]
+
+        if text_mask is not None:
+            text_mask = text_mask.bool()
+
+        boxes_xyxy, scores, masks, _ = self._detect(features, positions, text_embeddings, text_mask)
+        return {"boxes": boxes_xyxy, "scores": scores, "masks": masks}
+
 
 class SAM3Model(nn.Module):
     def __init__(self, device=None, dtype=None, operations=None, **kwargs):
@@ -534,13 +559,37 @@ class SAM3Model(nn.Module):
         )
         return high_res_masks
 
-    def forward_video(self, images, initial_masks, pbar=None):
+    def forward_video(self, images, initial_masks, pbar=None, text_prompts=None,
+                       new_det_thresh=0.5, max_objects=0, detect_interval=1):
+        """Track video with optional per-frame text-prompted detection."""
         bb = self.detector.backbone["vision_backbone"]
-        def backbone_fn(frame, frame_idx=None):  # noqa: frame_idx unused, passed by tracker
+
+        def backbone_fn(frame, frame_idx=None):
             trunk_out = bb.trunk(frame)
             if bb.multiplex:
                 _, _, tf, tp = bb(frame, tracker_mode="propagation", cached_trunk=trunk_out, tracker_only=True)
             else:
                 _, _, tf, tp = bb(frame, need_tracker=True, cached_trunk=trunk_out, tracker_only=True)
             return tf, tp, trunk_out
+
+        detect_fn = None
+        if text_prompts:
+            resizer = self.detector.backbone["language_backbone"]["resizer"]
+            resized = [(resizer(emb), m.bool() if m is not None else None) for emb, m in text_prompts]
+            def detect_fn(trunk_out):
+                all_scores, all_masks = [], []
+                for emb, mask in resized:
+                    det = self.detector.forward_from_trunk(trunk_out, emb, mask)
+                    all_scores.append(det["scores"])
+                    all_masks.append(det["masks"])
+                return {"scores": torch.cat(all_scores, dim=1), "masks": torch.cat(all_masks, dim=1)}
+
+        if hasattr(self.tracker, 'track_video_with_detection'):
+            return self.tracker.track_video_with_detection(
+                backbone_fn, images, initial_masks, detect_fn,
+                new_det_thresh=new_det_thresh, max_objects=max_objects,
+                detect_interval=detect_interval, backbone_obj=bb, pbar=pbar)
+        # SAM3 (non-multiplex) — no detection support, requires initial masks
+        if initial_masks is None:
+            raise ValueError("SAM3 (non-multiplex) requires initial_mask for video tracking")
         return self.tracker.track_video(backbone_fn, images, initial_masks, pbar=pbar, backbone_obj=bb)

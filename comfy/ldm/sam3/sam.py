@@ -356,7 +356,6 @@ class PositionEmbeddingSine(nn.Module):
         pos_y = torch.stack((pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2).flatten(1)
         return pos_x, pos_y
 
-    @torch.no_grad()
     def encode_boxes(self, cx, cy, w, h):
         """Encode box center + size to [N, d_model+2] features."""
         pos_x, pos_y = self._encode_xy(cx, cy)

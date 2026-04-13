@@ -27,17 +27,9 @@ class MultiplexState:
 
     def __init__(self, num_objects, multiplex_count, device, dtype):
         self.multiplex_count = multiplex_count
-        self.num_buckets = (num_objects + multiplex_count - 1) // multiplex_count
-        self.total_valid_entries = num_objects
-
-        # Precompute mux/demux matrices
-        total_slots = self.num_buckets * multiplex_count
-        self.mux_matrix = torch.zeros(total_slots, num_objects, device=device, dtype=dtype)
-        self.demux_matrix = torch.zeros(num_objects, total_slots, device=device, dtype=dtype)
-        for oid in range(num_objects):
-            slot = (oid // multiplex_count) * multiplex_count + (oid % multiplex_count)
-            self.mux_matrix[slot, oid] = 1.0
-            self.demux_matrix[oid, slot] = 1.0
+        self.device = device
+        self.dtype = dtype
+        self._build(num_objects)
 
     def mux(self, x):
         """[N_obj, ...] -> [num_buckets, multiplex_count, ...]"""
@@ -54,22 +46,57 @@ class MultiplexState:
         """[num_buckets, multiplex_count] bool tensor, True for valid slots."""
         return (self.mux_matrix.sum(dim=1) > 0).reshape(self.num_buckets, self.multiplex_count)
 
+    def _build(self, num_objects):
+        M = self.multiplex_count
+        self.num_buckets = (num_objects + M - 1) // M
+        self.total_valid_entries = num_objects
+        total_slots = self.num_buckets * M
+        self.mux_matrix = torch.zeros(total_slots, num_objects, device=self.device, dtype=self.dtype)
+        self.demux_matrix = torch.zeros(num_objects, total_slots, device=self.device, dtype=self.dtype)
+        oids = torch.arange(num_objects, device=self.device)
+        slots = (oids // M) * M + (oids % M)
+        self.mux_matrix[slots, oids] = 1.0
+        self.demux_matrix[oids, slots] = 1.0
 
-def _keep_largest_component(mask):
-    """Keep only the largest connected foreground component per object. mask: [B, 1, H, W] logits."""
-    result = mask.clone()
-    for i in range(mask.shape[0]):
-        m = (mask[i, 0] > 0).cpu().numpy()
-        if not m.any():
-            continue
-        labeled, num = ndimage.label(m)
-        if num <= 1:
-            continue
-        areas = [(labeled == c).sum() for c in range(1, num + 1)]
-        largest = max(range(len(areas)), key=lambda c: areas[c]) + 1
-        keep = torch.from_numpy(labeled == largest).to(mask.device)
-        result[i, 0] = torch.where(keep, mask[i, 0], torch.clamp(mask[i, 0], max=-10.0))
-    return result
+    def add_objects(self, n_new):
+        """Grow multiplex state for n_new additional objects."""
+        self._build(self.total_valid_entries + n_new)
+
+def _nms_masks(masks, scores, iou_thresh=0.5):
+    """Mask-based NMS. masks: [N, H, W] logits, scores: [N]. Returns (filtered_masks, filtered_scores)."""
+    order = scores.argsort(descending=True)
+    masks, scores = masks[order], scores[order]
+    keep = []
+    for i in range(masks.shape[0]):
+        if keep:
+            iou = _compute_mask_iou(masks[i:i+1], masks[torch.tensor(keep, device=masks.device)])
+            if iou.max() >= iou_thresh:
+                continue
+        keep.append(i)
+    return masks[keep], scores[keep]
+
+
+def _compute_mask_iou(masks_a, masks_b):
+    """Pairwise mask IoU. masks_a: [Na, H, W] logits, masks_b: [Nb, H, W] logits. Returns [Na, Nb]."""
+    a_flat = (masks_a > 0).float().flatten(1)  # [Na, HW]
+    b_flat = (masks_b > 0).float().flatten(1)  # [Nb, HW]
+    intersection = a_flat @ b_flat.T  # [Na, Nb]
+    area_a = a_flat.sum(1, keepdim=True)  # [Na, 1]
+    area_b = b_flat.sum(1, keepdim=True).T  # [1, Nb]
+    union = area_a + area_b - intersection
+    return intersection / union.clamp(min=1)
+
+
+def _compute_mask_overlap(masks_a, masks_b):
+    """Max of IoU and IoM (intersection over minimum area). More robust to size differences."""
+    a_flat = (masks_a > 0).float().flatten(1)
+    b_flat = (masks_b > 0).float().flatten(1)
+    intersection = a_flat @ b_flat.T
+    area_a = a_flat.sum(1, keepdim=True)
+    area_b = b_flat.sum(1, keepdim=True).T
+    iou = intersection / (area_a + area_b - intersection).clamp(min=1)
+    iom = intersection / torch.min(area_a.expand_as(iou), area_b.expand_as(iou)).clamp(min=1)
+    return torch.max(iou, iom)
 
 
 def _get_connected_components(mask_bin):
@@ -157,8 +184,16 @@ def get_1d_sine_pe(pos_inds, dim, temperature=10000):
     return torch.cat([pos_embed.sin(), pos_embed.cos()], dim=-1)
 
 
+def _pad_to_buckets(tensor, target_buckets):
+    """Pad a [num_buckets, ...] tensor to target_buckets along dim 0 if needed."""
+    if tensor.shape[0] >= target_buckets:
+        return tensor
+    pad_shape = (target_buckets - tensor.shape[0],) + tensor.shape[1:]
+    return torch.cat([tensor, torch.zeros(pad_shape, device=tensor.device, dtype=tensor.dtype)], dim=0)
+
+
 def collect_memory_tokens(output_dict, frame_idx, num_maskmem, maskmem_tpos_enc, device,
-                          collect_image_feats=False, tpos_v2=False):
+                          collect_image_feats=False, tpos_v2=False, num_buckets=None):
     """Collect spatial memory, position encodings, and optionally image features from past frames."""
     to_cat_memory, to_cat_memory_pos = [], []
     to_cat_image_feat, to_cat_image_pos = [], []
@@ -166,8 +201,12 @@ def collect_memory_tokens(output_dict, frame_idx, num_maskmem, maskmem_tpos_enc,
     cond_outputs = output_dict["cond_frame_outputs"]
     for t, out in cond_outputs.items():
         feats = out["maskmem_features"].to(device)
+        if num_buckets is not None:
+            feats = _pad_to_buckets(feats, num_buckets)
         to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
         maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
+        if num_buckets is not None:
+            maskmem_enc = _pad_to_buckets(maskmem_enc, num_buckets)
         if tpos_v2:
             # v2: temporal distance-based encoding for conditioning frames
             t_pos = frame_idx - t
@@ -192,8 +231,12 @@ def collect_memory_tokens(output_dict, frame_idx, num_maskmem, maskmem_tpos_enc,
         if out is None or out.get("maskmem_features") is None:
             continue
         feats = out["maskmem_features"].to(device)
+        if num_buckets is not None:
+            feats = _pad_to_buckets(feats, num_buckets)
         to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
         maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
+        if num_buckets is not None:
+            maskmem_enc = _pad_to_buckets(maskmem_enc, num_buckets)
         tpos_enc = cast_to_input(maskmem_tpos_enc[num_maskmem - t_pos - 1], maskmem_enc)
         maskmem_enc = maskmem_enc + tpos_enc
         to_cat_memory_pos.append(maskmem_enc)
@@ -1169,11 +1212,13 @@ class SAM31Tracker(nn.Module):
                                   self._no_obj_blend, self.image_size, self.backbone_stride)
 
     def _prepare_memory_conditioned_features(self, frame_idx, is_init_cond_frame, current_vision_feats,
-                                              current_vision_pos_embeds, feat_sizes, output_dict, num_frames):
+                                              current_vision_pos_embeds, feat_sizes, output_dict, num_frames,
+                                              multiplex_state=None):
         B = current_vision_feats[-1].shape[0]
         C = self.d_model
         H, W = feat_sizes[-1]
         device = current_vision_feats[-1].device
+        num_buc = multiplex_state.num_buckets if multiplex_state is not None else None
 
         if self.num_maskmem == 0:
             return current_vision_feats[-1].permute(0, 2, 1).view(B, C, H, W)
@@ -1183,31 +1228,39 @@ class SAM31Tracker(nn.Module):
             return to_spatial(pix_feat, H, W)
 
         to_cat_memory, to_cat_memory_pos, to_cat_image_feat, to_cat_image_pos, cond_outputs = collect_memory_tokens(
-            output_dict, frame_idx, self.num_maskmem, self.maskmem_tpos_enc, device, collect_image_feats=True, tpos_v2=True)
+            output_dict, frame_idx, self.num_maskmem, self.maskmem_tpos_enc, device,
+            collect_image_feats=True, tpos_v2=True, num_buckets=num_buc)
 
         max_obj_ptrs = min(num_frames, self.max_obj_ptrs_in_encoder)
         pos_and_ptrs = []
         for t, out in cond_outputs.items():
             if t <= frame_idx and "obj_ptr" in out:
-                pos_and_ptrs.append(((frame_idx - t), out["obj_ptr"].to(device)))
+                ptr = out["obj_ptr"].to(device)
+                if num_buc is not None:
+                    ptr = _pad_to_buckets(ptr, num_buc)
+                pos_and_ptrs.append(((frame_idx - t), ptr))
         for t_diff in range(1, max_obj_ptrs):
             t = frame_idx - t_diff
             if t < 0:
                 break
             out = output_dict["non_cond_frame_outputs"].get(t, None)
             if out is not None and "obj_ptr" in out:
-                pos_and_ptrs.append((t_diff, out["obj_ptr"].to(device)))
+                ptr = out["obj_ptr"].to(device)
+                if num_buc is not None:
+                    ptr = _pad_to_buckets(ptr, num_buc)
+                pos_and_ptrs.append((t_diff, ptr))
 
         num_obj_ptr_tokens = 0
         if len(pos_and_ptrs) > 0:
             pos_list, ptrs_list = zip(*pos_and_ptrs)
-            obj_ptrs = torch.stack(ptrs_list, dim=1)  # [B, N, M, C]
+            obj_ptrs = torch.stack(ptrs_list, dim=1)  # [num_buckets, N, M, C]
+            B_ptr = obj_ptrs.shape[0]
             N_ptrs = obj_ptrs.shape[1]
             M = obj_ptrs.shape[2]
-            obj_ptrs = obj_ptrs.reshape(B, N_ptrs * M, -1)
+            obj_ptrs = obj_ptrs.reshape(B_ptr, N_ptrs * M, -1)
             obj_pos = self._get_tpos_enc(list(pos_list), max_abs_pos=max_obj_ptrs, device=device, dtype=current_vision_feats[-1].dtype)
-            obj_pos = obj_pos.unsqueeze(0).expand(B, -1, -1)
-            obj_pos = obj_pos.unsqueeze(2).expand(-1, -1, M, -1).reshape(B, N_ptrs * M, -1)
+            obj_pos = obj_pos.unsqueeze(0).expand(B_ptr, -1, -1)
+            obj_pos = obj_pos.unsqueeze(2).expand(-1, -1, M, -1).reshape(B_ptr, N_ptrs * M, -1)
             to_cat_memory.append(obj_ptrs)
             to_cat_memory_pos.append(obj_pos)
             num_obj_ptr_tokens = obj_ptrs.shape[1]
@@ -1219,33 +1272,42 @@ class SAM31Tracker(nn.Module):
         memory = torch.cat(to_cat_memory, dim=1)
         memory_pos = torch.cat(to_cat_memory_pos, dim=1)
 
+        # Expand vision features to num_buckets if memory has more buckets than B
+        mem_B = memory.shape[0]
+        x = current_vision_feats[-1]
+        x_pos = current_vision_pos_embeds[-1]
+        if x.shape[0] < mem_B:
+            x = x.expand(mem_B, -1, -1)
+            x_pos = x_pos.expand(mem_B, -1, -1)
+
         if len(to_cat_image_feat) > 0:
             # Decoupled cross-attention: separate image features from memory
-            # Cast to match src dtype (position encodings may promote to fp32)
-            src = current_vision_feats[-1]
-            memory_image = cast_to_input(torch.cat(to_cat_image_feat, dim=1), src)
-            memory_image_pos = cast_to_input(torch.cat(to_cat_image_pos, dim=1), src)
+            memory_image = cast_to_input(torch.cat(to_cat_image_feat, dim=1), x)
+            memory_image_pos = cast_to_input(torch.cat(to_cat_image_pos, dim=1), x)
+            if memory_image.shape[0] < mem_B:
+                memory_image = memory_image.expand(mem_B, -1, -1)
+                memory_image_pos = memory_image_pos.expand(mem_B, -1, -1)
             pix_feat_with_mem = self.transformer.encoder(
-                x=src,
-                memory=cast_to_input(memory, src),
-                memory_pos=cast_to_input(memory_pos, src),
-                src_pos=cast_to_input(current_vision_pos_embeds[-1], src),
+                x=x,
+                memory=cast_to_input(memory, x),
+                memory_pos=cast_to_input(memory_pos, x),
+                src_pos=cast_to_input(x_pos, x),
                 num_k_exclude_rope=num_obj_ptr_tokens,
                 memory_image=memory_image,
                 memory_image_pos=memory_image_pos,
             )
         else:
             pix_feat_with_mem = self.transformer.encoder(
-                x=current_vision_feats[-1],
+                x=x,
                 memory=memory,
                 memory_pos=memory_pos,
-                src_pos=current_vision_pos_embeds[-1],
+                src_pos=x_pos,
                 num_k_exclude_rope=num_obj_ptr_tokens,
             )
         return to_spatial(pix_feat_with_mem, H, W)
 
     def _encode_new_memory(self, pix_feat, pred_masks_high_res, object_score_logits, is_mask_from_pts=False,
-                           multiplex_state=None, is_conditioning=False):
+                           multiplex_state=None, is_conditioning=False, cond_obj_mask=None):
         if is_mask_from_pts:
             mask_for_mem = (pred_masks_high_res > 0).to(pix_feat.dtype)
         else:
@@ -1255,11 +1317,13 @@ class SAM31Tracker(nn.Module):
         # Mux masks: [N_obj, 1, H, W] -> [num_buckets, M, H, W]
         mux_masks = multiplex_state.mux(mask_for_mem[:, 0])
 
-        # Conditioning: fg=1.0 only for conditioning frames, bg=0.0 for propagation
+        # Conditioning channel: 1.0 = clean mask (trust it), 0.0 = propagation (noisy)
         N_obj = mask_for_mem.shape[0]
         cond_values = torch.full((N_obj,), 0.0, device=mask_for_mem.device, dtype=mask_for_mem.dtype)
         if is_conditioning:
-            cond_values[:] = 1.0  # all objects are conditioning on conditioning frames
+            cond_values[:] = 1.0
+        elif cond_obj_mask is not None:
+            cond_values[cond_obj_mask] = 1.0
         cond_spatial = cond_values.view(-1, 1, 1, 1).expand_as(mask_for_mem[:, 0:1, :, :]).squeeze(1)
         mux_cond = multiplex_state.mux(cond_spatial)  # [num_buckets, M, H, W]
         mux_input = torch.cat([mux_masks, mux_cond], dim=1)  # [num_buckets, 2*M, H, W]
@@ -1357,6 +1421,7 @@ class SAM31Tracker(nn.Module):
                 frame_idx=frame_idx, is_init_cond_frame=is_init_cond_frame,
                 current_vision_feats=current_vision_feats, current_vision_pos_embeds=current_vision_pos_embeds,
                 feat_sizes=feat_sizes, output_dict=output_dict, num_frames=num_frames,
+                multiplex_state=multiplex_state,
             )
             hi_res = interactive_high_res if interactive_high_res is not None else propagation_high_res
             num_pts = point_inputs["point_labels"].size(1)
@@ -1371,6 +1436,7 @@ class SAM31Tracker(nn.Module):
                 frame_idx=frame_idx, is_init_cond_frame=is_init_cond_frame,
                 current_vision_feats=current_vision_feats, current_vision_pos_embeds=current_vision_pos_embeds,
                 feat_sizes=feat_sizes, output_dict=output_dict, num_frames=num_frames,
+                multiplex_state=multiplex_state,
             )
             sam_outputs = self._forward_propagation(pix_feat_with_mem, propagation_high_res,
                                                      multiplex_state=multiplex_state)
@@ -1417,96 +1483,275 @@ class SAM31Tracker(nn.Module):
         high_res = list(tracker_features[:-1])
         return vision_feats, vision_pos, feat_sizes, high_res, trunk_out
 
-    def _track_objects(self, backbone_fn, images, initial_masks, backbone_obj=None, pbar=None):
-        """Track objects, computing backbone per frame to save VRAM."""
-        N = images.shape[0]
-        N_obj = initial_masks.shape[0]
-        device, dt = images.device, images.dtype
+    @staticmethod
+    def _suppress_recently_occluded(low_res_masks, last_occluded, frame_idx, threshold=0.3):
+        """Suppress overlapping masks for objects that were most recently occluded.
+        Prevents corrupted masks from occluded objects from contaminating other objects."""
+        N_obj = low_res_masks.shape[0]
+        if N_obj <= 1:
+            return low_res_masks
+        binary = low_res_masks[:, 0] > 0  # [N_obj, H, W]
+        iou = _compute_mask_iou(low_res_masks[:, 0], low_res_masks[:, 0])
+        overlapping = torch.triu(iou >= threshold, diagonal=1)  # [N, N] upper triangle
+        last_occ_i = last_occluded.unsqueeze(1)  # [N, 1]
+        last_occ_j = last_occluded.unsqueeze(0)  # [1, N]
+        # Suppress the more recently occluded object in each overlapping pair
+        suppress_i = overlapping & (last_occ_i > last_occ_j) & (last_occ_j > -1)
+        suppress_j = overlapping & (last_occ_j > last_occ_i) & (last_occ_i > -1)
+        to_suppress = suppress_i.any(dim=1) | suppress_j.any(dim=0)
+        # Update last_occluded for occluded/suppressed objects
+        is_empty = ~binary.any(dim=(-1, -2))
+        newly_occluded = is_empty | to_suppress
+        last_occluded[newly_occluded] = frame_idx
+        # Suppress masks
+        low_res_masks[to_suppress] = -10.0
+        return low_res_masks
+
+    def _deferred_memory_encode(self, current_out, N_obj, vision_feats, feat_sizes, mux_state, device,
+                                cond_obj_mask=None):
+        """Deferred memory encoding for propagation frames. cond_obj_mask: per-object bool for conditioning."""
+        low_res_masks = current_out["pred_masks"]  # [N_obj, 1, H_low, W_low]
+
+        if N_obj > 1:
+            lr = low_res_masks.squeeze(1)  # [N_obj, H, W]
+            max_obj = torch.argmax(lr, dim=0, keepdim=True)
+            batch_inds = torch.arange(N_obj, device=device)[:, None, None]
+            pixel_nol = torch.where(max_obj == batch_inds, lr, torch.clamp(lr, max=-10.0))
+            area_before = (lr > 0).sum(dim=(-1, -2)).float().clamp(min=1)
+            area_after = (pixel_nol > 0).sum(dim=(-1, -2)).float()
+            shrink_ok = (area_after / area_before) >= 0.3
+            low_res_masks = torch.where(
+                shrink_ok[:, None, None, None].expand_as(low_res_masks),
+                low_res_masks, torch.clamp(low_res_masks, max=-10.0))
+
+        interpol_size = self.maskmem_backbone.mask_downsampler.interpol_size
+        mem_masks = F.interpolate(low_res_masks, size=interpol_size,
+                                  mode="bilinear", align_corners=False)
+
+        obj_scores = torch.where(
+            (mem_masks > 0).any(dim=(-1, -2)), 10.0, -10.0)
+
+        pix_feat = to_spatial(vision_feats[-1], feat_sizes[-1][0], feat_sizes[-1][1])
+        maskmem_features, maskmem_pos_enc = self._encode_new_memory(
+            pix_feat=pix_feat, pred_masks_high_res=mem_masks,
+            object_score_logits=obj_scores,
+            multiplex_state=mux_state, cond_obj_mask=cond_obj_mask)
+        current_out["maskmem_features"] = maskmem_features
+        current_out["maskmem_pos_enc"] = maskmem_pos_enc
+
+    def _add_detected_objects(self, new_masks, mux_state, vision_feats, feat_sizes, current_out):
+        """Grow MultiplexState with new detections, merge masks, re-encode memory. Modifies current_out."""
+        n_old = mux_state.total_valid_entries
+        mux_state.add_objects(new_masks.shape[0])
+        N_obj = mux_state.total_valid_entries
+        # Stored memory with old bucket counts is padded at read time by _pad_to_buckets
+        for k in ("pred_masks", "pred_masks_high_res"):
+            det = F.interpolate(new_masks.unsqueeze(1), size=current_out[k].shape[-2:],
+                                mode="bilinear", align_corners=False)
+            current_out[k] = torch.cat([current_out[k], det], dim=0)
+        if self.num_maskmem > 0:
+            # Mark new objects as conditioning (clean detection masks) so model trusts them
+            cond_mask = torch.zeros(N_obj, dtype=torch.bool, device=new_masks.device)
+            cond_mask[n_old:] = True
+            self._deferred_memory_encode(current_out, N_obj, vision_feats, feat_sizes,
+                                         mux_state, new_masks.device, cond_obj_mask=cond_mask)
+
+    def _condition_with_masks(self, masks, frame_idx, vision_feats, vision_pos, feat_sizes,
+                              high_res_prop, output_dict, N, mux_state, backbone_obj, frame,
+                              trunk_out, threshold=0.5):
+        """Condition tracker with masks on a frame."""
+        mask_input = F.interpolate(masks if masks.dim() == 4 else masks.unsqueeze(1),
+            size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        mask_input = (mask_input > threshold).to(masks.dtype)
+        hi_res = lo_feat = None
+        if backbone_obj is not None and backbone_obj.multiplex:
+            _, _, itf, _ = backbone_obj(frame, tracker_mode="interactive", cached_trunk=trunk_out, tracker_only=True)
+            hi_res, lo_feat = itf[:-1], itf[-1]
+        current_out = self.track_step(
+            frame_idx=frame_idx, is_init_cond_frame=True, current_vision_feats=vision_feats,
+            current_vision_pos_embeds=vision_pos, feat_sizes=feat_sizes, mask_inputs=mask_input,
+            output_dict=output_dict, num_frames=N, interactive_high_res=hi_res,
+            interactive_backbone=lo_feat, propagation_high_res=high_res_prop,
+            multiplex_state=mux_state, run_mem_encoder=True)
+        output_dict["cond_frame_outputs"][frame_idx] = current_out
+        return current_out
+
+    def _match_and_add_detections(self, det_masks, det_scores, current_out, mux_state,
+                                  vision_feats, feat_sizes, device, max_objects=0,
+                                  keep_alive=None):
+        """Match detections against tracked masks, add new objects, recondition degraded tracks.
+        Updates keep_alive counters: +1 for matched tracks, -1 for unmatched."""
+        N_obj = mux_state.total_valid_entries
+        if det_masks.shape[0] == 0:
+            if keep_alive is not None:
+                for i in range(N_obj):
+                    keep_alive[i] = max(-4, keep_alive.get(i, 0) - 1)
+            return
+
+        # Match at low-res (like reference)
+        trk_masks = current_out["pred_masks"][:, 0]  # [N_obj, H_low, W_low]
+        det_resized = F.interpolate(det_masks.unsqueeze(1), size=trk_masks.shape[-2:],
+                                    mode="bilinear", align_corners=False)[:, 0]
+        overlap = _compute_mask_overlap(det_resized, trk_masks)
+
+        # Update keep_alive and find matched tracks
+        matched = set()
+        if overlap.shape[1] > 0:
+            matched = set((overlap >= 0.5).any(dim=0).nonzero(as_tuple=True)[0].tolist())
+        if keep_alive is not None:
+            for i in range(N_obj):
+                if i in matched:
+                    keep_alive[i] = min(8, keep_alive.get(i, 0) + 1)
+                else:
+                    keep_alive[i] = max(-4, keep_alive.get(i, 0) - 1)
+
+        # Recondition: high-confidence detections (>=0.8) with high overlap refresh tracked masks
+        reconditioned = False
+        if det_scores is not None and overlap.shape[1] > 0:
+            HIGH_CONF = 0.8
+            for det_idx in range(overlap.shape[0]):
+                if det_scores[det_idx] < HIGH_CONF:
+                    continue
+                best_trk = overlap[det_idx].argmax().item()
+                if overlap[det_idx, best_trk] >= 0.5:
+                    # Replace tracked mask with fresh detection mask
+                    current_out["pred_masks"][best_trk] = det_resized[det_idx].unsqueeze(0)
+                    det_hr = F.interpolate(det_masks[det_idx:det_idx+1].unsqueeze(1),
+                        size=current_out["pred_masks_high_res"].shape[-2:],
+                        mode="bilinear", align_corners=False)
+                    current_out["pred_masks_high_res"][best_trk] = det_hr[0]
+                    reconditioned = True
+
+        # Re-encode memory if any tracks were reconditioned
+        if reconditioned and self.num_maskmem > 0:
+            self._deferred_memory_encode(current_out, N_obj, vision_feats, feat_sizes, mux_state, device)
+
+        # Add new detections (not matching any track)
+        if max_objects > 0 and N_obj >= max_objects:
+            return
+        max_overlap = overlap.max(dim=1)[0] if overlap.shape[1] > 0 else torch.zeros(overlap.shape[0], device=device)
+        new_dets = max_overlap < 0.5
+        if new_dets.any():
+            if max_objects > 0:
+                slots = max_objects - N_obj
+                new_dets = new_dets & (torch.cumsum(new_dets.int(), 0) <= slots)
+            self._add_detected_objects(det_masks[new_dets], mux_state,
+                                       vision_feats, feat_sizes, current_out)
+            if keep_alive is not None:
+                for i in range(N_obj, mux_state.total_valid_entries):
+                    keep_alive[i] = 1
+
+    def track_video_with_detection(self, backbone_fn, images, initial_masks, detect_fn=None,
+                                   new_det_thresh=0.5, max_objects=0, detect_interval=1,
+                                   backbone_obj=None, pbar=None):
+        """Track with optional per-frame detection. Returns [N, max_N_obj, H, W] mask logits."""
+        N, device, dt = images.shape[0], images.device, images.dtype
         output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
         all_masks = []
-
-        mux_state = MultiplexState(num_objects=N_obj, multiplex_count=self.num_multiplex, device=device, dtype=dt)
+        idev = comfy.model_management.intermediate_device()
+        empty = lambda: torch.zeros(0, self.image_size, self.image_size, device=idev, dtype=dt)
+        mux_state = None
+        if initial_masks is not None:
+            mux_state = MultiplexState(initial_masks.shape[0], self.num_multiplex, device, dt)
+        keep_alive = {} if detect_fn is not None else None
+        last_occluded = torch.empty(0, device=device, dtype=torch.long)  # per-object last occluded frame
 
         for frame_idx in tqdm(range(N), desc="tracking"):
-            vision_feats, vision_pos, feat_sizes, high_res_prop, trunk_out = self._compute_backbone_frame(
-                backbone_fn, images[frame_idx:frame_idx + 1], frame_idx=frame_idx)
-            mask_input = None
-            if frame_idx == 0:
-                mask_input = F.interpolate(initial_masks.to(device=device, dtype=dt),
-                    size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
-                mask_input = (mask_input > 0.5).to(dt)
+            frame = images[frame_idx:frame_idx + 1]
+            vision_feats, vision_pos, feat_sizes, high_res_prop, trunk_out = \
+                self._compute_backbone_frame(backbone_fn, frame, frame_idx=frame_idx)
 
-            interactive_high_res = None
-            interactive_backbone = None
-            if mask_input is not None and backbone_obj is not None and backbone_obj.multiplex:
-                _, _, itf, _ = backbone_obj(images[frame_idx:frame_idx+1], tracker_mode="interactive",
-                                             cached_trunk=trunk_out, tracker_only=True)
-                interactive_high_res = itf[:-1]
-                interactive_backbone = itf[-1]
+            # Per-frame detection with NMS (skip if no detect_fn, or interval/max not met)
+            det_masks = torch.empty(0, device=device)
+            det_scores = None
+            run_det = (detect_fn is not None
+                       and frame_idx % max(detect_interval, 1) == 0
+                       and not (max_objects > 0 and mux_state is not None
+                                and mux_state.total_valid_entries >= max_objects))
+            if run_det:
+                det_out = detect_fn(trunk_out)
+                scores = det_out["scores"][0].sigmoid()
+                keep = scores > new_det_thresh
+                det_masks, det_scores = det_out["masks"][0][keep], scores[keep]
+                if det_masks.shape[0] > 1:
+                    det_masks, det_scores = _nms_masks(det_masks, det_scores)
 
-            # Conditioning frames: encode memory immediately (clean initial masks)
-            # Propagation frames: defer memory encoding to after mask cleanup
-            is_cond = (frame_idx == 0)
-            current_out = self.track_step(
-                frame_idx=frame_idx, is_init_cond_frame=is_cond,
-                current_vision_feats=vision_feats, current_vision_pos_embeds=vision_pos,
-                feat_sizes=feat_sizes, mask_inputs=mask_input, output_dict=output_dict, num_frames=N,
-                interactive_high_res=interactive_high_res, interactive_backbone=interactive_backbone,
-                propagation_high_res=high_res_prop, multiplex_state=mux_state,
-                run_mem_encoder=is_cond)
-
-            if not is_cond and self.num_maskmem > 0:
-                # Deferred memory encoding matching reference _tracker_update_memories
-                low_res_masks = current_out["pred_masks"]  # [N_obj, 1, H_low, W_low]
-
-                if N_obj > 1:
-                    # Non-overlapping suppression on low-res (resolution-invariant, cheaper)
-                    lr = low_res_masks.squeeze(1)  # [N_obj, H, W]
-                    max_obj = torch.argmax(lr, dim=0, keepdim=True)
-                    batch_inds = torch.arange(N_obj, device=device)[:, None, None]
-                    pixel_nol = torch.where(max_obj == batch_inds, lr, torch.clamp(lr, max=-10.0))
-                    area_before = (lr > 0).sum(dim=(-1, -2)).float().clamp(min=1)
-                    area_after = (pixel_nol > 0).sum(dim=(-1, -2)).float()
-                    shrink_ok = (area_after / area_before) >= 0.3
-                    low_res_masks = torch.where(
-                        shrink_ok[:, None, None, None].expand_as(low_res_masks),
-                        low_res_masks, torch.clamp(low_res_masks, max=-10.0))
-
-                # Interpolate to interpol_size for memory backbone
-                interpol_size = self.maskmem_backbone.mask_downsampler.interpol_size
-                mem_masks = F.interpolate(low_res_masks, size=interpol_size,
-                                          mode="bilinear", align_corners=False)
-
-                # Keep only largest connected component (prevents drift noise in memory and output)
-                # mem_masks = _keep_largest_component(mem_masks)
-                # current_out["pred_masks_high_res"] = _keep_largest_component(
-                #     current_out["pred_masks_high_res"])
-
-                obj_scores = torch.where(
-                    (mem_masks > 0).any(dim=(-1, -2)), 10.0, -10.0)
-
-                pix_feat = to_spatial(vision_feats[-1], feat_sizes[-1][0], feat_sizes[-1][1])
-                maskmem_features, maskmem_pos_enc = self._encode_new_memory(
-                    pix_feat=pix_feat, pred_masks_high_res=mem_masks,
-                    object_score_logits=obj_scores,
-                    multiplex_state=mux_state)
-                current_out["maskmem_features"] = maskmem_features
-                current_out["maskmem_pos_enc"] = maskmem_pos_enc
-
-            if is_cond:
-                output_dict["cond_frame_outputs"][frame_idx] = current_out
+            if frame_idx == 0 and initial_masks is not None:
+                # Frame 0 with initial masks: condition only, skip detection
+                current_out = self._condition_with_masks(
+                    initial_masks.to(device=device, dtype=dt), frame_idx, vision_feats, vision_pos,
+                    feat_sizes, high_res_prop, output_dict, N, mux_state, backbone_obj, frame, trunk_out)
+                last_occluded = torch.full((mux_state.total_valid_entries,), -1, device=device, dtype=torch.long)
+                if keep_alive is not None:
+                    for i in range(mux_state.total_valid_entries):
+                        keep_alive[i] = 8
+            elif mux_state is None or mux_state.total_valid_entries == 0:
+                # No objects yet — initialize from detections
+                if det_masks.shape[0] > 0:
+                    if max_objects > 0:
+                        det_masks = det_masks[:max_objects]
+                    mux_state = MultiplexState(det_masks.shape[0], self.num_multiplex, device, dt)
+                    current_out = self._condition_with_masks(
+                        det_masks, frame_idx, vision_feats, vision_pos, feat_sizes, high_res_prop,
+                        output_dict, N, mux_state, backbone_obj, frame, trunk_out, threshold=0.0)
+                    last_occluded = torch.full((mux_state.total_valid_entries,), -1, device=device, dtype=torch.long)
+                    if keep_alive is not None:
+                        for i in range(mux_state.total_valid_entries):
+                            keep_alive[i] = 1
+                else:
+                    all_masks.append(empty())
+                    if pbar is not None:
+                        pbar.update(1)
+                    continue
             else:
+                # Propagation step
+                N_obj = mux_state.total_valid_entries
+                current_out = self.track_step(
+                    frame_idx=frame_idx, is_init_cond_frame=False, current_vision_feats=vision_feats,
+                    current_vision_pos_embeds=vision_pos, feat_sizes=feat_sizes, mask_inputs=None,
+                    output_dict=output_dict, num_frames=N, propagation_high_res=high_res_prop,
+                    multiplex_state=mux_state, run_mem_encoder=False)
+                # Fill holes, suppress recently occluded, then encode memory
+                current_out["pred_masks"] = fill_holes_in_mask_scores(
+                    current_out["pred_masks"], max_area=16)
+                if last_occluded.shape[0] == N_obj and N_obj > 1:
+                    self._suppress_recently_occluded(
+                        current_out["pred_masks"], last_occluded, frame_idx)
+                if self.num_maskmem > 0:
+                    self._deferred_memory_encode(current_out, N_obj, vision_feats, feat_sizes, mux_state, device)
                 output_dict["non_cond_frame_outputs"][frame_idx] = current_out
                 lookback = max(self.num_maskmem, self.max_obj_ptrs_in_encoder)
                 for old_idx in list(output_dict["non_cond_frame_outputs"]):
                     if old_idx < frame_idx - lookback:
                         del output_dict["non_cond_frame_outputs"][old_idx]
-            all_masks.append(current_out["pred_masks_high_res"][:, 0].to(comfy.model_management.intermediate_device()))
+                n_before = mux_state.total_valid_entries
+                self._match_and_add_detections(det_masks, det_scores, current_out, mux_state,
+                                               vision_feats, feat_sizes, device, max_objects,
+                                               keep_alive if run_det else None)
+                # Grow last_occluded for newly added objects
+                n_added = mux_state.total_valid_entries - n_before
+                if n_added > 0:
+                    last_occluded = torch.cat([last_occluded,
+                        torch.full((n_added,), -1, device=device, dtype=torch.long)])
+
+            # Suppress objects with depleted keep_alive in output (but keep in memory for recovery)
+            masks_out = current_out["pred_masks_high_res"][:, 0]  # [N_obj, H, W]
+            if keep_alive is not None:
+                for i in range(masks_out.shape[0]):
+                    if keep_alive.get(i, 0) <= 0:
+                        masks_out[i] = NO_OBJ_SCORE
+            N_obj_now = mux_state.total_valid_entries if mux_state is not None else 0
+            all_masks.append(masks_out.to(idev) if N_obj_now > 0 else empty())
             if pbar is not None:
                 pbar.update(1)
 
-        return torch.stack(all_masks, dim=0)  # [N, N_obj, H, W]
+        if not all_masks or all(m.shape[0] == 0 for m in all_masks):
+            return torch.zeros(N, 0, self.image_size, self.image_size, device=idev, dtype=dt)
 
-    def track_video(self, backbone_fn, images, initial_masks, pbar=None, backbone_obj=None):
-        """Track objects across video frames using multiplex decoder."""
-        return self._track_objects(backbone_fn, images, initial_masks, backbone_obj=backbone_obj, pbar=pbar)
+        # Post-pad: frames before an object appeared get NO_OBJ_SCORE
+        max_obj = max(m.shape[0] for m in all_masks)
+        for i, m in enumerate(all_masks):
+            if m.shape[0] < max_obj:
+                pad = torch.full((max_obj - m.shape[0], *m.shape[1:]), NO_OBJ_SCORE, device=m.device, dtype=m.dtype)
+                all_masks[i] = torch.cat([m, pad], dim=0)
+        return torch.stack(all_masks, dim=0)
