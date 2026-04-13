@@ -5,11 +5,15 @@ SAM3 (Segment Anything 3) ComfyUI nodes for detection, segmentation, and video t
 from typing_extensions import override
 
 import json
+import os
+import uuid
+import numpy as np
 import torch
 import torch.nn.functional as F
 import comfy.model_management
 import comfy.utils
-from comfy_api.latest import ComfyExtension, io
+import folder_paths
+from comfy_api.latest import ComfyExtension, io, ui
 
 
 def _extract_text_prompts(conditioning, device, dtype):
@@ -52,6 +56,9 @@ def _refine_mask(sam3_model, orig_image_hwc, coarse_mask, box_xyxy, H, W, device
     cy1 = max(0, int(y1 - bh * pad_frac))
     cx2 = min(W, int(x2 + bw * pad_frac))
     cy2 = min(H, int(y2 + bh * pad_frac))
+    if cx2 <= cx1 or cy2 <= cy1:
+        mask = F.interpolate(coarse_mask.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)
+        return (mask[0] > 0).float()
 
     crop = orig_image_hwc[cy1:cy2, cx1:cx2]
     crop_1008 = comfy.utils.common_upscale(crop.unsqueeze(0).movedim(-1, 1), 1008, 1008, "bilinear", crop="disabled")
@@ -157,10 +164,10 @@ class SAM3_Detect(io.ComfyNode):
         all_bbox_dicts = []
         all_masks = []
         pbar = comfy.utils.ProgressBar(B)
+        b_boxes_tensor = boxes_tensor.to(device=device, dtype=dtype) if boxes_tensor is not None else None
 
         for b in range(B):
             frame = image_in[b:b+1].to(device=device, dtype=dtype)
-            b_boxes_tensor = boxes_tensor.to(device=device, dtype=dtype) if boxes_tensor is not None else None
 
             frame_bbox_dicts = []
             frame_masks = []
@@ -341,14 +348,15 @@ class SAM3_VideoTrack(io.ComfyNode):
 
         mask_logits = sam3_model.forward_video(
             images=frames_in, initial_masks=init_masks, pbar=pbar, text_prompts=text_prompts,
-            new_det_thresh=detection_threshold, max_objects=max_objects, detect_interval=detect_interval)
+            new_det_thresh=detection_threshold, max_objects=max_objects,
+            detect_interval=detect_interval)
 
         # mask_logits: [N, N_obj, 1008, 1008] on intermediate device
         return io.NodeOutput({"logits": mask_logits, "orig_size": (H, W)})
 
 
 class SAM3_TrackPreview(io.ComfyNode):
-    """Visualize tracked objects with distinct colors overlaid on video frames."""
+    """Visualize tracked objects with distinct colors as a video preview. No tensor output — saves to temp video."""
 
     @classmethod
     def define_schema(cls):
@@ -360,10 +368,9 @@ class SAM3_TrackPreview(io.ComfyNode):
                 SAM3TrackData.Input("track_data", display_name="track_data"),
                 io.Image.Input("images", display_name="images", optional=True),
                 io.Float.Input("opacity", display_name="opacity", default=0.5, min=0.0, max=1.0, step=0.05),
+                io.Float.Input("fps", display_name="fps", default=24.0, min=1.0, max=120.0, step=1.0),
             ],
-            outputs=[
-                io.Image.Output("preview", display_name="preview"),
-            ],
+            is_output_node=True,
         )
 
     COLORS = [
@@ -373,42 +380,65 @@ class SAM3_TrackPreview(io.ComfyNode):
     ]
 
     @classmethod
-    def execute(cls, track_data, images=None, opacity=0.5) -> io.NodeOutput:
+    def execute(cls, track_data, images=None, opacity=0.5, fps=24.0) -> io.NodeOutput:
+        import av
+        from fractions import Fraction
+
         logits = track_data["logits"]  # [N, N_obj, H_model, W_model]
         N, N_obj = logits.shape[:2]
         H, W = track_data["orig_size"]
-
         if images is not None:
             H, W = images.shape[1], images.shape[2]
-            preview = images.clone()
-        else:
-            preview = torch.zeros(N, H, W, 3)
 
-        if N_obj == 0:
-            return io.NodeOutput(preview)
+        # Compute centroids at model resolution (cheap), scale to output coords
+        Hm, Wm = logits.shape[-2:]
+        cy_np, cx_np, has_np = None, None, None
+        if N_obj > 0:
+            binary = logits > 0  # [N, N_obj, Hm, Wm] — model res, no upscale
+            grid_y = torch.arange(Hm, device=logits.device).float().view(1, 1, Hm, 1)
+            grid_x = torch.arange(Wm, device=logits.device).float().view(1, 1, 1, Wm)
+            area = binary.sum(dim=(-1, -2)).float().clamp(min=1)
+            cy_np = ((binary * grid_y).sum(dim=(-1, -2)).float() / area * H / Hm).int().cpu().numpy()
+            cx_np = ((binary * grid_x).sum(dim=(-1, -2)).float() / area * W / Wm).int().cpu().numpy()
+            has_np = (area > 1).cpu().numpy()
 
-        masks = F.interpolate(logits.float(), size=(H, W), mode="bilinear", align_corners=False)
+        # Write frames one at a time — upscale per frame, encode, discard
+        temp_dir = folder_paths.get_temp_directory()
+        filename = "sam3_track_preview.mp4"
+        filepath = os.path.join(temp_dir, filename)
+        colors_np = [(int(r * 255), int(g * 255), int(b * 255)) for r, g, b in cls.COLORS]
+        with av.open(filepath, mode='w') as output:
+            stream = output.add_stream('h264', rate=Fraction(round(fps * 1000), 1000))
+            stream.width = W
+            stream.height = H
+            stream.pix_fmt = 'yuv420p'
 
-        for obj_idx in range(N_obj):
-            r, g, b = cls.COLORS[obj_idx % len(cls.COLORS)]
-            color = torch.tensor([r, g, b], device=preview.device, dtype=preview.dtype)
-            obj_mask = (masks[:, obj_idx] > 0).float()  # [N, H, W]
-            alpha = (obj_mask * opacity).unsqueeze(-1)  # [N, H, W, 1]
-            preview = preview * (1 - alpha) + color * alpha
+            for t in range(N):
+                if images is not None:
+                    frame_np = (images[t] * 255).clamp(0, 255).byte().cpu().numpy()
+                else:
+                    frame_np = np.zeros((H, W, 3), dtype=np.uint8)
 
-        # Draw object index numbers at mask centroids
-        preview_np = (preview * 255).clamp(0, 255).byte().cpu().numpy()
-        for t in range(N):
-            for obj_idx in range(N_obj):
-                m = masks[t, obj_idx] > 0
-                if not m.any():
-                    continue
-                ys, xs = torch.where(m)
-                cy, cx = int(ys.float().mean()), int(xs.float().mean())
-                _draw_number(preview_np[t], obj_idx, cx, cy, cls.COLORS[obj_idx % len(cls.COLORS)])
-        preview = torch.from_numpy(preview_np).float().div(255).to(device=preview.device)
+                if N_obj > 0:
+                    # Upscale this frame's masks only
+                    frame_masks = F.interpolate(logits[t:t+1].float(), size=(H, W),
+                                               mode="bilinear", align_corners=False)[0]  # [N_obj, H, W]
+                    for obj_idx in range(N_obj):
+                        m = frame_masks[obj_idx].cpu().numpy() > 0
+                        if not m.any():
+                            continue
+                        r, g, b = colors_np[obj_idx % len(colors_np)]
+                        fg = frame_np[m].astype(np.float32)
+                        frame_np[m] = (fg * (1 - opacity) + opacity * np.array([r, g, b], dtype=np.float32)).clip(0, 255).astype(np.uint8)
+                        if has_np is not None and has_np[t, obj_idx]:
+                            _draw_number(frame_np, obj_idx, int(cx_np[t, obj_idx]), int(cy_np[t, obj_idx]),
+                                         cls.COLORS[obj_idx % len(cls.COLORS)])
 
-        return io.NodeOutput(preview)
+                vframe = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
+                output.mux(stream.encode(vframe.reformat(format='yuv420p')))
+            output.mux(stream.encode(None))
+
+        return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(filename, "", io.FolderType.temp)]))
 
 
 class SAM3_TrackToMask(io.ComfyNode):
