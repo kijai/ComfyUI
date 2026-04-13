@@ -1,10 +1,17 @@
 # SAM3 video tracker: memory encoder, memory attention, SAM mask decoder/prompt encoder.
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from scipy import ndimage
+
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    from scipy import ndimage
+    _HAS_CV2 = False
 
 import comfy.model_management
 from comfy.ldm.modules.attention import optimized_attention
@@ -104,13 +111,17 @@ def _get_connected_components(mask_bin):
     labels_list, areas_list = [], []
     for i in range(mask_bin.shape[0]):
         m = mask_bin[i, 0].cpu().numpy()
-        labeled, num_features = ndimage.label(m)
-        areas = torch.zeros_like(mask_bin[i, 0], dtype=torch.int32)
-        for c in range(1, num_features + 1):
-            component = labeled == c
-            areas[component] = component.sum()
+        if _HAS_CV2:
+            _, labeled, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+            areas = stats[labeled, cv2.CC_STAT_AREA].astype('int32')
+        else:
+            labeled, num_features = ndimage.label(m)
+            areas = np.zeros_like(m, dtype=np.int32)
+            for c in range(1, num_features + 1):
+                component = labeled == c
+                areas[component] = component.sum()
         labels_list.append(torch.from_numpy(labeled).to(mask_bin.device))
-        areas_list.append(areas)
+        areas_list.append(torch.from_numpy(areas).to(device=mask_bin.device, dtype=torch.int32))
     return torch.stack(labels_list).unsqueeze(1), torch.stack(areas_list).unsqueeze(1)
 
 
@@ -1656,10 +1667,26 @@ class SAM31Tracker(nn.Module):
         keep_alive = {} if detect_fn is not None else None
         last_occluded = torch.empty(0, device=device, dtype=torch.long)  # per-object last occluded frame
 
+        # Prefetch next frame's backbone on a separate CUDA stream
+        prefetch = False
+        backbone_stream = None
+        if comfy.model_management.is_device_cuda(device):
+            try:
+                backbone_stream = torch.cuda.Stream(device=device)
+                prefetch = True
+            except RuntimeError:
+                pass
+        cur_bb = self._compute_backbone_frame(backbone_fn, images[0:1], frame_idx=0)
+
         for frame_idx in tqdm(range(N), desc="tracking"):
-            frame = images[frame_idx:frame_idx + 1]
-            vision_feats, vision_pos, feat_sizes, high_res_prop, trunk_out = \
-                self._compute_backbone_frame(backbone_fn, frame, frame_idx=frame_idx)
+            vision_feats, vision_pos, feat_sizes, high_res_prop, trunk_out = cur_bb
+
+            # Start next frame's backbone on separate stream (overlaps with current frame's work)
+            if prefetch and frame_idx + 1 < N:
+                backbone_stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(backbone_stream):
+                    next_bb = self._compute_backbone_frame(
+                        backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
 
             # Per-frame detection with NMS (skip if no detect_fn, or interval/max not met)
             det_masks = torch.empty(0, device=device)
@@ -1677,23 +1704,23 @@ class SAM31Tracker(nn.Module):
                     det_masks, det_scores = _nms_masks(det_masks, det_scores)
 
             if frame_idx == 0 and initial_masks is not None:
-                # Frame 0 with initial masks: condition only, skip detection
                 current_out = self._condition_with_masks(
                     initial_masks.to(device=device, dtype=dt), frame_idx, vision_feats, vision_pos,
-                    feat_sizes, high_res_prop, output_dict, N, mux_state, backbone_obj, frame, trunk_out)
+                    feat_sizes, high_res_prop, output_dict, N, mux_state, backbone_obj,
+                    images[frame_idx:frame_idx + 1], trunk_out)
                 last_occluded = torch.full((mux_state.total_valid_entries,), -1, device=device, dtype=torch.long)
                 if keep_alive is not None:
                     for i in range(mux_state.total_valid_entries):
                         keep_alive[i] = 8
             elif mux_state is None or mux_state.total_valid_entries == 0:
-                # No objects yet — initialize from detections
                 if det_masks.shape[0] > 0:
                     if max_objects > 0:
                         det_masks = det_masks[:max_objects]
                     mux_state = MultiplexState(det_masks.shape[0], self.num_multiplex, device, dt)
                     current_out = self._condition_with_masks(
                         det_masks, frame_idx, vision_feats, vision_pos, feat_sizes, high_res_prop,
-                        output_dict, N, mux_state, backbone_obj, frame, trunk_out, threshold=0.0)
+                        output_dict, N, mux_state, backbone_obj,
+                        images[frame_idx:frame_idx + 1], trunk_out, threshold=0.0)
                     last_occluded = torch.full((mux_state.total_valid_entries,), -1, device=device, dtype=torch.long)
                     if keep_alive is not None:
                         for i in range(mux_state.total_valid_entries):
@@ -1702,16 +1729,19 @@ class SAM31Tracker(nn.Module):
                     all_masks.append(empty())
                     if pbar is not None:
                         pbar.update(1)
+                    if prefetch and frame_idx + 1 < N:
+                        torch.cuda.current_stream(device).wait_stream(backbone_stream)
+                        cur_bb = next_bb
+                    elif not prefetch and frame_idx + 1 < N:
+                        cur_bb = self._compute_backbone_frame(backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
                     continue
             else:
-                # Propagation step
                 N_obj = mux_state.total_valid_entries
                 current_out = self.track_step(
                     frame_idx=frame_idx, is_init_cond_frame=False, current_vision_feats=vision_feats,
                     current_vision_pos_embeds=vision_pos, feat_sizes=feat_sizes, mask_inputs=None,
                     output_dict=output_dict, num_frames=N, propagation_high_res=high_res_prop,
                     multiplex_state=mux_state, run_mem_encoder=False)
-                # Fill holes, suppress recently occluded, then encode memory
                 current_out["pred_masks"] = fill_holes_in_mask_scores(
                     current_out["pred_masks"], max_area=16)
                 if last_occluded.shape[0] == N_obj and N_obj > 1:
@@ -1728,14 +1758,12 @@ class SAM31Tracker(nn.Module):
                 self._match_and_add_detections(det_masks, det_scores, current_out, mux_state,
                                                vision_feats, feat_sizes, device, max_objects,
                                                keep_alive if run_det else None)
-                # Grow last_occluded for newly added objects
                 n_added = mux_state.total_valid_entries - n_before
                 if n_added > 0:
                     last_occluded = torch.cat([last_occluded,
                         torch.full((n_added,), -1, device=device, dtype=torch.long)])
 
-            # Suppress objects with depleted keep_alive in output (but keep in memory for recovery)
-            masks_out = current_out["pred_masks_high_res"][:, 0]  # [N_obj, H, W]
+            masks_out = current_out["pred_masks_high_res"][:, 0]
             if keep_alive is not None:
                 for i in range(masks_out.shape[0]):
                     if keep_alive.get(i, 0) <= 0:
@@ -1744,6 +1772,14 @@ class SAM31Tracker(nn.Module):
             all_masks.append(masks_out.to(idev) if N_obj_now > 0 else empty())
             if pbar is not None:
                 pbar.update(1)
+
+            # Next frame's backbone
+            if frame_idx + 1 < N:
+                if prefetch:
+                    torch.cuda.current_stream(device).wait_stream(backbone_stream)
+                    cur_bb = next_bb
+                else:
+                    cur_bb = self._compute_backbone_frame(backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
 
         if not all_masks or all(m.shape[0] == 0 for m in all_masks):
             return torch.zeros(N, 0, self.image_size, self.image_size, device=idev, dtype=dt)

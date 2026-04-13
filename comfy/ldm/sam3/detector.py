@@ -339,7 +339,7 @@ class SegmentationHead(nn.Module):
     def __init__(self, d_model=256, num_heads=8, device=None, dtype=None, operations=None):
         super().__init__()
         self.d_model = d_model
-        self.pixel_decoder = PixelDecoder(d_model, 2, device=device, dtype=dtype, operations=operations)
+        self.pixel_decoder = PixelDecoder(d_model, 3, device=device, dtype=dtype, operations=operations)
         self.mask_predictor = MaskPredictor(d_model, device=device, dtype=dtype, operations=operations)
         self.cross_attend_prompt = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
         self.cross_attn_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -410,8 +410,6 @@ class SAM3Detector(nn.Module):
             all_f, all_p, tf, tp = bb(images, tracker_mode="propagation")
         else:
             all_f, all_p, tf, tp = bb(images, need_tracker=True)
-        if self.scalp > 0:
-            all_f, all_p = all_f[:-self.scalp], all_p[:-self.scalp]
         return all_f, all_p, tf, tp
 
     @staticmethod
@@ -425,6 +423,11 @@ class SAM3Detector(nn.Module):
                 points=None, boxes=None):
         """Shared detection: geometry encoding, transformer, scoring, segmentation."""
         B = features[0].shape[0]
+        # Scalp for encoder (use top-level feature), but keep all levels for segmentation head
+        seg_features = features
+        if self.scalp > 0:
+            features = features[:-self.scalp]
+            positions = positions[:-self.scalp]
         enc_feat, enc_pos = features[-1], positions[-1]
         _, _, H, W = enc_feat.shape
         img_flat = enc_feat.flatten(2).permute(0, 2, 1)
@@ -459,7 +462,7 @@ class SAM3Detector(nn.Module):
         else:
             scores = torch.zeros(B, query_out.shape[1], device=query_out.device)
 
-        masks = self.segmentation_head(query_out, features, encoder_hidden_states=memory, prompt=text_embeddings, prompt_mask=text_mask)
+        masks = self.segmentation_head(query_out, seg_features, encoder_hidden_states=memory, prompt=text_embeddings, prompt_mask=text_mask)
         return box_cxcywh_to_xyxy(pred_boxes), scores, masks, dec_out
 
     def forward(self, images, text_embeddings=None, text_mask=None, points=None, boxes=None, threshold=0.3, orig_size=None):
@@ -494,8 +497,6 @@ class SAM3Detector(nn.Module):
         bb = self.backbone["vision_backbone"]
         features = [conv(trunk_out) for conv in bb.convs]
         positions = [cast_to_input(bb.position_encoding(f), f) for f in features]
-        if self.scalp > 0:
-            features, positions = features[:-self.scalp], positions[:-self.scalp]
 
         if text_mask is not None:
             text_mask = text_mask.bool()
