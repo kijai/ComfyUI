@@ -18,8 +18,7 @@ SAM3_CLIP_CONFIG = {
 
 class SAM3ClipModel(sd1_clip.SDClipModel):
     def __init__(self, device="cpu", dtype=None, model_options={}):
-        super().__init__(device=device, dtype=dtype, max_length=32, layer="last", textmodel_json_config=SAM3_CLIP_CONFIG, special_tokens={"start": 49406, "end": 49407, "pad": 0}, return_projected_pooled=True, return_attention_masks=True, enable_attention_masks=True, model_options=model_options)
-        self.transformer.text_projection = self.operations.Linear(1024, 512, bias=False, dtype=dtype, device=device)
+        super().__init__(device=device, dtype=dtype, max_length=32, layer="last", textmodel_json_config=SAM3_CLIP_CONFIG, special_tokens={"start": 49406, "end": 49407, "pad": 0}, return_projected_pooled=False, return_attention_masks=True, enable_attention_masks=True, model_options=model_options)
 
 
 class SAM3Tokenizer(sd1_clip.SDTokenizer):
