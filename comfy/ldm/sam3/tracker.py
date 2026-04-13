@@ -69,31 +69,6 @@ class MultiplexState:
         """Grow multiplex state for n_new additional objects."""
         self._build(self.total_valid_entries + n_new)
 
-def _nms_masks(masks, scores, iou_thresh=0.5):
-    """Mask-based NMS. masks: [N, H, W] logits, scores: [N]. Returns (filtered_masks, filtered_scores)."""
-    order = scores.argsort(descending=True)
-    masks, scores = masks[order], scores[order]
-    keep = []
-    for i in range(masks.shape[0]):
-        if keep:
-            iou = _compute_mask_iou(masks[i:i+1], masks[torch.tensor(keep, device=masks.device)])
-            if iou.max() >= iou_thresh:
-                continue
-        keep.append(i)
-    return masks[keep], scores[keep]
-
-
-def _compute_mask_iou(masks_a, masks_b):
-    """Pairwise mask IoU. masks_a: [Na, H, W] logits, masks_b: [Nb, H, W] logits. Returns [Na, Nb]."""
-    a_flat = (masks_a > 0).float().flatten(1)  # [Na, HW]
-    b_flat = (masks_b > 0).float().flatten(1)  # [Nb, HW]
-    intersection = a_flat @ b_flat.T  # [Na, Nb]
-    area_a = a_flat.sum(1, keepdim=True)  # [Na, 1]
-    area_b = b_flat.sum(1, keepdim=True).T  # [1, Nb]
-    union = area_a + area_b - intersection
-    return intersection / union.clamp(min=1)
-
-
 def _compute_mask_overlap(masks_a, masks_b):
     """Max of IoU and IoM (intersection over minimum area). More robust to size differences."""
     a_flat = (masks_a > 0).float().flatten(1)
@@ -104,6 +79,19 @@ def _compute_mask_overlap(masks_a, masks_b):
     iou = intersection / (area_a + area_b - intersection).clamp(min=1)
     iom = intersection / torch.min(area_a.expand_as(iou), area_b.expand_as(iou)).clamp(min=1)
     return torch.max(iou, iom)
+
+
+def _nms_masks(masks, scores, thresh=0.5):
+    """Mask-based NMS using IoU+IoM overlap. Returns (filtered_masks, filtered_scores)."""
+    order = scores.argsort(descending=True)
+    masks, scores = masks[order], scores[order]
+    keep = []
+    for i in range(masks.shape[0]):
+        if keep:
+            if _compute_mask_overlap(masks[i:i+1], masks[torch.tensor(keep, device=masks.device)]).max() >= thresh:
+                continue
+        keep.append(i)
+    return masks[keep], scores[keep]
 
 
 def _get_connected_components(mask_bin):
@@ -203,57 +191,49 @@ def _pad_to_buckets(tensor, target_buckets):
     return torch.cat([tensor, torch.zeros(pad_shape, device=tensor.device, dtype=tensor.dtype)], dim=0)
 
 
+def _compute_backbone(backbone_fn, frame, frame_idx=None):
+    """Compute backbone features for a single frame. Returns (vision_feats, vision_pos, feat_sizes, features, trunk_out)."""
+    features, positions, trunk_out = backbone_fn(frame, frame_idx=frame_idx)
+    feat_sizes = [(x.shape[-2], x.shape[-1]) for x in features]
+    vision_feats = [x.flatten(2).permute(0, 2, 1) for x in features]
+    vision_pos = [x.flatten(2).permute(0, 2, 1) for x in positions]
+    return vision_feats, vision_pos, feat_sizes, features, trunk_out
+
+
 def collect_memory_tokens(output_dict, frame_idx, num_maskmem, maskmem_tpos_enc, device,
                           collect_image_feats=False, tpos_v2=False, num_buckets=None):
     """Collect spatial memory, position encodings, and optionally image features from past frames."""
     to_cat_memory, to_cat_memory_pos = [], []
     to_cat_image_feat, to_cat_image_pos = [], []
 
+    def _append(out, tpos_idx):
+        feats = out["maskmem_features"].to(device)
+        if num_buckets is not None:
+            feats = _pad_to_buckets(feats, num_buckets)
+        to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
+        enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
+        if num_buckets is not None:
+            enc = _pad_to_buckets(enc, num_buckets)
+        tpos = cast_to_input(maskmem_tpos_enc[tpos_idx], enc)
+        to_cat_memory_pos.append(enc + tpos)
+        if collect_image_feats and "image_features" in out:
+            to_cat_image_feat.append(out["image_features"].to(device))
+            to_cat_image_pos.append(out["image_pos_enc"].to(device) + tpos)
+
     cond_outputs = output_dict["cond_frame_outputs"]
     for t, out in cond_outputs.items():
-        feats = out["maskmem_features"].to(device)
-        if num_buckets is not None:
-            feats = _pad_to_buckets(feats, num_buckets)
-        to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
-        maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
-        if num_buckets is not None:
-            maskmem_enc = _pad_to_buckets(maskmem_enc, num_buckets)
         if tpos_v2:
-            # v2: temporal distance-based encoding for conditioning frames
             t_pos = frame_idx - t
-            if t_pos <= 0 or t_pos >= num_maskmem:
-                tpos_idx = num_maskmem - 1
-            else:
-                tpos_idx = num_maskmem - t_pos - 1
+            tpos_idx = num_maskmem - t_pos - 1 if 0 < t_pos < num_maskmem else num_maskmem - 1
         else:
-            # v1: conditioning frames always use last position
             tpos_idx = num_maskmem - 1
-        tpos_enc = cast_to_input(maskmem_tpos_enc[tpos_idx], maskmem_enc)
-        maskmem_enc = maskmem_enc + tpos_enc
-        to_cat_memory_pos.append(maskmem_enc)
-        if collect_image_feats and "image_features" in out:
-            to_cat_image_feat.append(out["image_features"].to(device))
-            to_cat_image_pos.append(out["image_pos_enc"].to(device) + tpos_enc)
+        _append(out, tpos_idx)
 
     for t_pos in range(1, num_maskmem):
-        t_rel = num_maskmem - t_pos
-        prev_frame_idx = frame_idx - t_rel
-        out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+        out = output_dict["non_cond_frame_outputs"].get(frame_idx - (num_maskmem - t_pos), None)
         if out is None or out.get("maskmem_features") is None:
             continue
-        feats = out["maskmem_features"].to(device)
-        if num_buckets is not None:
-            feats = _pad_to_buckets(feats, num_buckets)
-        to_cat_memory.append(feats.flatten(2).permute(0, 2, 1))
-        maskmem_enc = out["maskmem_pos_enc"][-1].to(device).flatten(2).permute(0, 2, 1)
-        if num_buckets is not None:
-            maskmem_enc = _pad_to_buckets(maskmem_enc, num_buckets)
-        tpos_enc = cast_to_input(maskmem_tpos_enc[num_maskmem - t_pos - 1], maskmem_enc)
-        maskmem_enc = maskmem_enc + tpos_enc
-        to_cat_memory_pos.append(maskmem_enc)
-        if collect_image_feats and "image_features" in out:
-            to_cat_image_feat.append(out["image_features"].to(device))
-            to_cat_image_pos.append(out["image_pos_enc"].to(device) + tpos_enc)
+        _append(out, num_maskmem - t_pos - 1)
 
     return to_cat_memory, to_cat_memory_pos, to_cat_image_feat, to_cat_image_pos, cond_outputs
 
@@ -900,10 +880,6 @@ class SAM3Tracker(nn.Module):
         self.sigmoid_scale_for_mem_enc = 20.0
         self.sigmoid_bias_for_mem_enc = -10.0
 
-    # Tracking methods
-    def _get_tpos_enc(self, rel_pos_list, device, dtype=None, max_abs_pos=None):
-        return compute_tpos_enc(rel_pos_list, device, self.d_model, self.obj_ptr_tpos_proj, dtype, max_abs_pos)
-
     def _no_obj_blend(self, obj_ptr, is_obj):
         alpha = is_obj.to(obj_ptr.dtype)
         return torch.lerp(cast_to_input(self.no_obj_ptr, obj_ptr), obj_ptr, alpha)
@@ -956,8 +932,9 @@ class SAM3Tracker(nn.Module):
             obj_ptrs = torch.stack(ptrs_list, dim=1)  # [B, N, C=256]
 
             # Temporal position encoding for pointers
-            obj_pos = self._get_tpos_enc(
-                list(pos_list), max_abs_pos=max_obj_ptrs, device=device, dtype=current_vision_feats[-1].dtype
+            obj_pos = compute_tpos_enc(
+                list(pos_list), device, self.d_model, self.obj_ptr_tpos_proj,
+                max_abs_pos=max_obj_ptrs, dtype=current_vision_feats[-1].dtype
             )  # [N, mem_dim=64]
             obj_pos = obj_pos.unsqueeze(0).expand(B, -1, -1)  # [B, N, 64]
 
@@ -1084,14 +1061,9 @@ class SAM3Tracker(nn.Module):
         return current_out
 
     def _compute_backbone_frame(self, backbone_fn, frame, frame_idx=None):
-        """Compute backbone features for a single frame."""
-        sam2_features, sam2_positions, _trunk = backbone_fn(frame, frame_idx=frame_idx)
-        backbone_fpn = sam2_features[:-1]
-        vision_pos_enc = sam2_positions[:-1]
-        feat_sizes = [(x.shape[-2], x.shape[-1]) for x in backbone_fpn]
-        vision_feats = [x.flatten(2).permute(0, 2, 1) for x in backbone_fpn]
-        vision_pos = [x.flatten(2).permute(0, 2, 1) for x in vision_pos_enc]
-        return vision_feats, vision_pos, feat_sizes
+        vision_feats, vision_pos, feat_sizes, _, _ = _compute_backbone(backbone_fn, frame, frame_idx)
+        # SAM3: drop last FPN level
+        return vision_feats[:-1], vision_pos[:-1], feat_sizes[:-1]
 
     def _track_single_object(self, backbone_fn, images, initial_mask, pbar=None):
         """Track one object, computing backbone per frame to save VRAM."""
@@ -1203,9 +1175,6 @@ class SAM31Tracker(nn.Module):
         # Position encoding for image (used by multiplex decoder)
         self.image_pe_layer = PositionEmbeddingRandom(d_model // 2)
 
-    def _get_tpos_enc(self, rel_pos_list, device, dtype=None, max_abs_pos=None):
-        return compute_tpos_enc(rel_pos_list, device, self.d_model, self.obj_ptr_tpos_proj, dtype, max_abs_pos)
-
     def _no_obj_blend(self, obj_ptr, is_obj):
         alpha = is_obj.to(obj_ptr.dtype)
         return torch.lerp(self.no_obj_ptr_linear(obj_ptr), obj_ptr, alpha)
@@ -1269,7 +1238,8 @@ class SAM31Tracker(nn.Module):
             N_ptrs = obj_ptrs.shape[1]
             M = obj_ptrs.shape[2]
             obj_ptrs = obj_ptrs.reshape(B_ptr, N_ptrs * M, -1)
-            obj_pos = self._get_tpos_enc(list(pos_list), max_abs_pos=max_obj_ptrs, device=device, dtype=current_vision_feats[-1].dtype)
+            obj_pos = compute_tpos_enc(list(pos_list), device, self.d_model, self.obj_ptr_tpos_proj,
+                                       max_abs_pos=max_obj_ptrs, dtype=current_vision_feats[-1].dtype)
             obj_pos = obj_pos.unsqueeze(0).expand(B_ptr, -1, -1)
             obj_pos = obj_pos.unsqueeze(2).expand(-1, -1, M, -1).reshape(B_ptr, N_ptrs * M, -1)
             to_cat_memory.append(obj_ptrs)
@@ -1486,13 +1456,8 @@ class SAM31Tracker(nn.Module):
         return current_out
 
     def _compute_backbone_frame(self, backbone_fn, frame, frame_idx=None):
-        """Compute backbone features for a single frame."""
-        tracker_features, tracker_positions, trunk_out = backbone_fn(frame, frame_idx=frame_idx)
-        feat_sizes = [(x.shape[-2], x.shape[-1]) for x in tracker_features]
-        vision_feats = [x.flatten(2).permute(0, 2, 1) for x in tracker_features]
-        vision_pos = [x.flatten(2).permute(0, 2, 1) for x in tracker_positions]
-        high_res = list(tracker_features[:-1])
-        return vision_feats, vision_pos, feat_sizes, high_res, trunk_out
+        vision_feats, vision_pos, feat_sizes, features, trunk_out = _compute_backbone(backbone_fn, frame, frame_idx)
+        return vision_feats, vision_pos, feat_sizes, list(features[:-1]), trunk_out
 
     @staticmethod
     def _suppress_recently_occluded(low_res_masks, last_occluded, frame_idx, threshold=0.3):
@@ -1502,7 +1467,7 @@ class SAM31Tracker(nn.Module):
         if N_obj <= 1:
             return low_res_masks
         binary = low_res_masks[:, 0] > 0  # [N_obj, H, W]
-        iou = _compute_mask_iou(low_res_masks[:, 0], low_res_masks[:, 0])
+        iou = _compute_mask_overlap(low_res_masks[:, 0], low_res_masks[:, 0])
         overlapping = torch.triu(iou >= threshold, diagonal=1)  # [N, N] upper triangle
         last_occ_i = last_occluded.unsqueeze(1)  # [N, 1]
         last_occ_j = last_occluded.unsqueeze(0)  # [1, N]
@@ -1729,11 +1694,13 @@ class SAM31Tracker(nn.Module):
                     all_masks.append(empty())
                     if pbar is not None:
                         pbar.update(1)
-                    if prefetch and frame_idx + 1 < N:
-                        torch.cuda.current_stream(device).wait_stream(backbone_stream)
-                        cur_bb = next_bb
-                    elif not prefetch and frame_idx + 1 < N:
-                        cur_bb = self._compute_backbone_frame(backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
+                    # Skip to backbone advance at end of loop
+                    if frame_idx + 1 < N:
+                        if prefetch:
+                            torch.cuda.current_stream(device).wait_stream(backbone_stream)
+                            cur_bb = next_bb
+                        else:
+                            cur_bb = self._compute_backbone_frame(backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
                     continue
             else:
                 N_obj = mux_state.total_valid_entries
