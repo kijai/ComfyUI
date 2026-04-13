@@ -191,6 +191,19 @@ def _pad_to_buckets(tensor, target_buckets):
     return torch.cat([tensor, torch.zeros(pad_shape, device=tensor.device, dtype=tensor.dtype)], dim=0)
 
 
+def pack_masks(masks):
+    """Pack binary masks [*, H, W] to bit-packed [*, H, W//8] uint8. W must be divisible by 8."""
+    binary = masks > 0
+    shifts = torch.arange(8, device=masks.device)
+    return (binary.view(*masks.shape[:-1], -1, 8) * (1 << shifts)).sum(-1).byte()
+
+
+def unpack_masks(packed, W):
+    """Unpack bit-packed [*, H, W//8] uint8 to bool [*, H, W]."""
+    shifts = torch.arange(8, device=packed.device)
+    return ((packed.unsqueeze(-1) >> shifts) & 1).view(*packed.shape[:-1], -1)[..., :W].bool()
+
+
 def _compute_backbone(backbone_fn, frame, frame_idx=None):
     """Compute backbone features for a single frame. Returns (vision_feats, vision_pos, feat_sizes, features, trunk_out)."""
     features, positions, trunk_out = backbone_fn(frame, frame_idx=frame_idx)
@@ -1737,7 +1750,7 @@ class SAM31Tracker(nn.Module):
                         masks_out[i] = NO_OBJ_SCORE
             N_obj_now = mux_state.total_valid_entries if mux_state is not None else 0
             if N_obj_now > 0:
-                all_masks.append((masks_out > 0).byte().to(idev))
+                all_masks.append(pack_masks(masks_out).to(idev))
             else:
                 all_masks.append(None)
             if pbar is not None:
@@ -1752,15 +1765,15 @@ class SAM31Tracker(nn.Module):
                     cur_bb = self._compute_backbone_frame(backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
 
         if not all_masks or all(m is None for m in all_masks):
-            return {"masks": None, "n_frames": N}
+            return {"packed": None, "mask_w": self.image_size, "n_frames": N, "mask_h": self.image_size}
 
         max_obj = max(m.shape[0] for m in all_masks if m is not None)
         sample = next(m for m in all_masks if m is not None)
-        empty_mask = torch.zeros(max_obj, *sample.shape[1:], dtype=torch.uint8, device=sample.device)
+        empty_packed = torch.zeros(max_obj, *sample.shape[1:], dtype=torch.uint8, device=sample.device)
         for i, m in enumerate(all_masks):
             if m is None:
-                all_masks[i] = empty_mask
+                all_masks[i] = empty_packed
             elif m.shape[0] < max_obj:
                 pad = torch.zeros(max_obj - m.shape[0], *m.shape[1:], dtype=torch.uint8, device=m.device)
                 all_masks[i] = torch.cat([m, pad], dim=0)
-        return {"masks": torch.stack(all_masks, dim=0), "n_frames": N}
+        return {"packed": torch.stack(all_masks, dim=0), "mask_w": self.image_size, "n_frames": N}

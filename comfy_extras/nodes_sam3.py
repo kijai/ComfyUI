@@ -1,5 +1,5 @@
 """
-SAM3 (Segment Anything 3) ComfyUI nodes for detection, segmentation, and video tracking.
+SAM3 (Segment Anything 3) nodes for detection, segmentation, and video tracking.
 """
 
 from typing_extensions import override
@@ -243,68 +243,6 @@ class SAM3_Detect(io.ComfyNode):
 
 SAM3TrackData = io.Custom("SAM3_TRACK_DATA")
 
-# 5x3 bitmap font atlas for digits 0-9 [10, 5, 3]
-_DIGIT_ATLAS = torch.tensor([
-    [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]],
-    [[0,1,0],[1,1,0],[0,1,0],[0,1,0],[1,1,1]],
-    [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]],
-    [[1,1,1],[0,0,1],[1,1,1],[0,0,1],[1,1,1]],
-    [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]],
-    [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]],
-    [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]],
-    [[1,1,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]],
-    [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]],
-    [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]],
-], dtype=torch.bool)
-
-_GLYPH_CACHE = {}  # (device, scale) -> (glyphs, outlines, gh, gw, oh, ow)
-
-def _get_glyphs(device, scale=3):
-    key = (device, scale)
-    if key in _GLYPH_CACHE:
-        return _GLYPH_CACHE[key]
-    atlas = _DIGIT_ATLAS.to(device)
-    glyphs, outlines = [], []
-    for d in range(10):
-        g = atlas[d].repeat_interleave(scale, 0).repeat_interleave(scale, 1)
-        padded = F.pad(g.float().unsqueeze(0).unsqueeze(0), (1,1,1,1))
-        o = (F.max_pool2d(padded, 3, stride=1, padding=1)[0, 0] > 0)
-        glyphs.append(g)
-        outlines.append(o)
-    gh, gw = glyphs[0].shape
-    oh, ow = outlines[0].shape
-    _GLYPH_CACHE[key] = (glyphs, outlines, gh, gw, oh, ow)
-    return _GLYPH_CACHE[key]
-
-def _draw_number_gpu(frame, number, cx, cy, color, scale=3):
-    """Draw a number on a GPU tensor [H, W, 3] uint8 at (cx, cy) with outline."""
-    H, W = frame.shape[:2]
-    device = frame.device
-    glyphs, outlines, gh, gw, oh, ow = _get_glyphs(device, scale)
-    color_t = torch.tensor([int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)],
-                           device=device, dtype=frame.dtype)
-    digs = [int(d) for d in str(number)]
-    total_w = len(digs) * (gw + scale) - scale
-    x0 = cx - total_w // 2
-    y0 = cy - gh // 2
-    for i, d in enumerate(digs):
-        dx = x0 + i * (gw + scale)
-        # Black outline
-        oy0, ox0 = y0 - 1, dx - 1
-        osy1, osx1 = max(0, -oy0), max(0, -ox0)
-        osy2, osx2 = min(oh, H - oy0), min(ow, W - ox0)
-        if osy2 > osy1 and osx2 > osx1:
-            fy1, fx1 = oy0 + osy1, ox0 + osx1
-            frame[fy1:fy1+(osy2-osy1), fx1:fx1+(osx2-osx1)][outlines[d][osy1:osy2, osx1:osx2]] = 0
-        # Colored fill
-        sy1, sx1 = max(0, -y0), max(0, -dx)
-        sy2, sx2 = min(gh, H - y0), min(gw, W - dx)
-        if sy2 > sy1 and sx2 > sx1:
-            fy1, fx1 = y0 + sy1, dx + sx1
-            frame[fy1:fy1+(sy2-sy1), fx1:fx1+(sx2-sx1)][glyphs[d][sy1:sy2, sx1:sx2]] = color_t
-
-
-
 class SAM3_VideoTrack(io.ComfyNode):
     """Track objects across video frames using SAM3's memory-based tracker."""
 
@@ -385,17 +323,78 @@ class SAM3_TrackPreview(io.ComfyNode):
         (0.74, 0.74, 0.13), (0.09, 0.75, 0.81), (0.94, 0.76, 0.06), (0.42, 0.68, 0.84),
     ]
 
+    # 5x3 bitmap font atlas for digits 0-9 [10, 5, 3]
+    _glyph_cache = {}  # (device, scale) -> (glyphs, outlines, gh, gw, oh, ow)
+
+    @staticmethod
+    def _get_glyphs(device, scale=3):
+        key = (device, scale)
+        if key in SAM3_TrackPreview._glyph_cache:
+            return SAM3_TrackPreview._glyph_cache[key]
+        atlas = torch.tensor([
+            [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]],
+            [[0,1,0],[1,1,0],[0,1,0],[0,1,0],[1,1,1]],
+            [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]],
+            [[1,1,1],[0,0,1],[1,1,1],[0,0,1],[1,1,1]],
+            [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]],
+            [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]],
+            [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]],
+            [[1,1,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]],
+            [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]],
+            [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]],
+        ], dtype=torch.bool)
+        glyphs, outlines = [], []
+        for d in range(10):
+            g = atlas[d].repeat_interleave(scale, 0).repeat_interleave(scale, 1)
+            padded = F.pad(g.float().unsqueeze(0).unsqueeze(0), (1,1,1,1))
+            o = (F.max_pool2d(padded, 3, stride=1, padding=1)[0, 0] > 0)
+            glyphs.append(g.to(device))
+            outlines.append(o.to(device))
+        gh, gw = glyphs[0].shape
+        oh, ow = outlines[0].shape
+        SAM3_TrackPreview._glyph_cache[key] = (glyphs, outlines, gh, gw, oh, ow)
+        return SAM3_TrackPreview._glyph_cache[key]
+
+    @staticmethod
+    def _draw_number_gpu(frame, number, cx, cy, color, scale=3):
+        """Draw a number on a GPU tensor [H, W, 3] float 0-1 at (cx, cy) with outline."""
+        H, W = frame.shape[:2]
+        device = frame.device
+        glyphs, outlines, gh, gw, oh, ow = SAM3_TrackPreview._get_glyphs(device, scale)
+        color_t = torch.tensor(color, device=device, dtype=frame.dtype)
+        digs = [int(d) for d in str(number)]
+        total_w = len(digs) * (gw + scale) - scale
+        x0 = cx - total_w // 2
+        y0 = cy - gh // 2
+        for i, d in enumerate(digs):
+            dx = x0 + i * (gw + scale)
+            # Black outline
+            oy0, ox0 = y0 - 1, dx - 1
+            osy1, osx1 = max(0, -oy0), max(0, -ox0)
+            osy2, osx2 = min(oh, H - oy0), min(ow, W - ox0)
+            if osy2 > osy1 and osx2 > osx1:
+                fy1, fx1 = oy0 + osy1, ox0 + osx1
+                frame[fy1:fy1+(osy2-osy1), fx1:fx1+(osx2-osx1)][outlines[d][osy1:osy2, osx1:osx2]] = 0
+            # Colored fill
+            sy1, sx1 = max(0, -y0), max(0, -dx)
+            sy2, sx2 = min(gh, H - y0), min(gw, W - dx)
+            if sy2 > sy1 and sx2 > sx1:
+                fy1, fx1 = y0 + sy1, dx + sx1
+                frame[fy1:fy1+(sy2-sy1), fx1:fx1+(sx2-sx1)][glyphs[d][sy1:sy2, sx1:sx2]] = color_t
+
     @classmethod
     def execute(cls, track_data, images=None, opacity=0.5, fps=24.0) -> io.NodeOutput:
 
-        masks = track_data["masks"]  # [N, N_obj, H_model, W_model] uint8 or None
+        from comfy.ldm.sam3.tracker import unpack_masks
+        packed = track_data["packed"]  # [N, N_obj, H, W_packed] uint8 or None
+        mask_w = track_data["mask_w"]
         H, W = track_data["orig_size"]
         if images is not None:
             H, W = images.shape[1], images.shape[2]
-        if masks is None:
+        if packed is None:
             N, N_obj = track_data["n_frames"], 0
         else:
-            N, N_obj = masks.shape[0], masks.shape[1]
+            N, N_obj = packed.shape[0], packed.shape[1]
 
         gpu = comfy.model_management.get_torch_device()
         temp_dir = folder_paths.get_temp_directory()
@@ -407,21 +406,22 @@ class SAM3_TrackPreview(io.ComfyNode):
             stream.height = H
             stream.pix_fmt = 'yuv420p'
 
-            a = int(opacity * 255)
+            frame_cpu = torch.empty(H, W, 3, dtype=torch.uint8)
+            frame_np = frame_cpu.numpy()
             if N_obj > 0:
-                colors_t = torch.tensor([[int(r * 255), int(g * 255), int(b * 255)]
-                                        for r, g, b in [cls.COLORS[i % len(cls.COLORS)] for i in range(N_obj)]],
-                                       device=gpu, dtype=torch.uint8)
+                colors_t = torch.tensor([cls.COLORS[i % len(cls.COLORS)] for i in range(N_obj)],
+                                       device=gpu, dtype=torch.float32)
                 grid_y = torch.arange(H, device=gpu).view(1, H, 1)
                 grid_x = torch.arange(W, device=gpu).view(1, 1, W)
             for t in range(N):
                 if images is not None:
-                    frame = (images[t] * 255).clamp(0, 255).byte()
+                    frame = images[t].clone()
                 else:
-                    frame = torch.zeros(H, W, 3, dtype=torch.uint8)
+                    frame = torch.zeros(H, W, 3)
 
                 if N_obj > 0:
-                    frame_masks = F.interpolate(masks[t:t+1].to(gpu).float(), size=(H, W), mode="nearest")[0]
+                    frame_binary = unpack_masks(packed[t:t+1].to(gpu), mask_w)  # [1, N_obj, H, W] bool
+                    frame_masks = F.interpolate(frame_binary.float(), size=(H, W), mode="nearest")[0]
                     frame_gpu = frame.to(gpu)
                     bool_masks = frame_masks > 0.5
                     any_mask = bool_masks.any(dim=0)
@@ -429,19 +429,18 @@ class SAM3_TrackPreview(io.ComfyNode):
                         obj_idx_map = bool_masks.to(torch.uint8).argmax(dim=0)
                         color_overlay = colors_t[obj_idx_map]
                         mask_3d = any_mask.unsqueeze(-1)
-                        blended = (frame_gpu.short() * (255 - a) + color_overlay.short() * a) // 255
-                        frame_gpu = torch.where(mask_3d, blended.to(torch.uint8), frame_gpu)
-                    area = bool_masks.sum(dim=(-1, -2)).clamp(min=1)
+                        frame_gpu = torch.where(mask_3d, frame_gpu * (1 - opacity) + color_overlay * opacity, frame_gpu)
+                    area = bool_masks.sum(dim=(-1, -2)).clamp_(min=1)
                     cy = (bool_masks * grid_y).sum(dim=(-1, -2)) // area
                     cx = (bool_masks * grid_x).sum(dim=(-1, -2)) // area
                     has = area > 1
                     for obj_idx in range(N_obj):
                         if has[obj_idx]:
-                            _draw_number_gpu(frame_gpu, obj_idx, int(cx[obj_idx]), int(cy[obj_idx]),
+                            SAM3_TrackPreview._draw_number_gpu(frame_gpu, obj_idx, int(cx[obj_idx]), int(cy[obj_idx]),
                                              cls.COLORS[obj_idx % len(cls.COLORS)])
-                    frame_np = frame_gpu.cpu().numpy()
+                    frame_cpu.copy_(frame_gpu.clamp_(0, 1).mul_(255).byte())
                 else:
-                    frame_np = frame.numpy()
+                    frame_cpu.copy_(frame.clamp_(0, 1).mul_(255).byte())
 
                 vframe = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
                 output.mux(stream.encode(vframe.reformat(format='yuv420p')))
@@ -470,14 +469,16 @@ class SAM3_TrackToMask(io.ComfyNode):
 
     @classmethod
     def execute(cls, track_data, object_indices="") -> io.NodeOutput:
-        masks = track_data["masks"]  # [N, N_obj, H_model, W_model] uint8 or None
+        from comfy.ldm.sam3.tracker import unpack_masks
+        packed = track_data["packed"]
+        mask_w = track_data["mask_w"]
         H, W = track_data["orig_size"]
 
-        if masks is None:
+        if packed is None:
             N = track_data["n_frames"]
             return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
 
-        N, N_obj = masks.shape[0], masks.shape[1]
+        N, N_obj = packed.shape[0], packed.shape[1]
 
         if object_indices.strip():
             indices = [int(i.strip()) for i in object_indices.split(",") if i.strip().isdigit()]
@@ -488,8 +489,9 @@ class SAM3_TrackToMask(io.ComfyNode):
         if not indices:
             return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
 
-        selected = masks[:, indices]  # [N, len(indices), Hm, Wm] uint8
-        union = selected.any(dim=1, keepdim=True).float()  # [N, 1, Hm, Wm]
+        selected = packed[:, indices]
+        binary = unpack_masks(selected, mask_w)  # [N, len(indices), Hm, Wm] bool
+        union = binary.any(dim=1, keepdim=True).float()
         mask_out = F.interpolate(union, size=(H, W), mode="bilinear", align_corners=False)[:, 0]
         return io.NodeOutput(mask_out)
 
