@@ -6,14 +6,14 @@ from typing_extensions import override
 
 import json
 import os
-import uuid
-import numpy as np
 import torch
 import torch.nn.functional as F
 import comfy.model_management
 import comfy.utils
 import folder_paths
 from comfy_api.latest import ComfyExtension, io, ui
+import av
+from fractions import Fraction
 
 
 def _extract_text_prompts(conditioning, device, dtype):
@@ -44,11 +44,13 @@ def _refine_mask(sam3_model, orig_image_hwc, coarse_mask, box_xyxy, H, W, device
 
     Returns: [1, H, W] binary mask
     """
-    if iterations <= 0:
-        mask = F.interpolate(coarse_mask.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)
-        return (mask[0] > 0).float()
+    def _coarse_fallback():
+        return (F.interpolate(coarse_mask.unsqueeze(0).unsqueeze(0), size=(H, W),
+                              mode="bilinear", align_corners=False)[0] > 0).float()
 
-    # Crop detection region from original image with padding
+    if iterations <= 0:
+        return _coarse_fallback()
+
     pad_frac = 0.1
     x1, y1, x2, y2 = box_xyxy.tolist()
     bw, bh = x2 - x1, y2 - y1
@@ -57,8 +59,7 @@ def _refine_mask(sam3_model, orig_image_hwc, coarse_mask, box_xyxy, H, W, device
     cx2 = min(W, int(x2 + bw * pad_frac))
     cy2 = min(H, int(y2 + bh * pad_frac))
     if cx2 <= cx1 or cy2 <= cy1:
-        mask = F.interpolate(coarse_mask.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)
-        return (mask[0] > 0).float()
+        return _coarse_fallback()
 
     crop = orig_image_hwc[cy1:cy2, cx1:cx2]
     crop_1008 = comfy.utils.common_upscale(crop.unsqueeze(0).movedim(-1, 1), 1008, 1008, "bilinear", crop="disabled")
@@ -195,51 +196,35 @@ class SAM3_Detect(io.ComfyNode):
                     frame_masks.append((mask[0] > 0).float())
 
             # Text prompts: run detector per text prompt (each detects one category)
-            prompts = cond_list if has_text else []
-            for prompt in prompts:
-                if prompt is not None:
-                    text_embeddings, text_mask, max_det = prompt
-                else:
-                    text_embeddings, text_mask, max_det = None, None, 1
-
+            for text_embeddings, text_mask, max_det in cond_list:
                 results = sam3_model(
-                    frame,
-                    text_embeddings=text_embeddings,
-                    text_mask=text_mask,
-                    boxes=b_boxes_tensor,
-                    threshold=threshold,
-                    orig_size=(H, W),
-                )
+                    frame, text_embeddings=text_embeddings, text_mask=text_mask,
+                    boxes=b_boxes_tensor, threshold=threshold, orig_size=(H, W))
 
                 pred_boxes = results["boxes"][0]
                 scores = results["scores"][0]
                 masks = results["masks"][0]
 
-                if has_text:
-                    probs = scores.sigmoid()
-                    keep = probs > threshold
-                    kept_boxes = pred_boxes[keep].cpu()
-                    kept_scores = probs[keep].cpu()
-                    kept_masks = masks[keep]
+                probs = scores.sigmoid()
+                keep = probs > threshold
+                kept_boxes = pred_boxes[keep].cpu()
+                kept_scores = probs[keep].cpu()
+                kept_masks = masks[keep]
 
-                    order = kept_scores.argsort(descending=True)[:max_det]
-                    kept_boxes = kept_boxes[order]
-                    kept_scores = kept_scores[order]
-                    kept_masks = kept_masks[order]
+                order = kept_scores.argsort(descending=True)[:max_det]
+                kept_boxes = kept_boxes[order]
+                kept_scores = kept_scores[order]
+                kept_masks = kept_masks[order]
 
-                    for box, score in zip(kept_boxes, kept_scores):
-                        frame_bbox_dicts.append({
-                            "x": float(box[0]), "y": float(box[1]),
-                            "width": float(box[2] - box[0]), "height": float(box[3] - box[1]),
-                            "score": float(score),
-                        })
-                    if kept_masks.shape[0] > 0:
-                        for m, box in zip(kept_masks, kept_boxes):
-                            frame_masks.append(_refine_mask(
-                                sam3_model, image[b], m, box, H, W, device, dtype, refine_iterations))
-                else:
+                for box, score in zip(kept_boxes, kept_scores):
+                    frame_bbox_dicts.append({
+                        "x": float(box[0]), "y": float(box[1]),
+                        "width": float(box[2] - box[0]), "height": float(box[3] - box[1]),
+                        "score": float(score),
+                    })
+                for m, box in zip(kept_masks, kept_boxes):
                     frame_masks.append(_refine_mask(
-                        sam3_model, image[b], masks[0], pred_boxes[0].cpu(), H, W, device, dtype, refine_iterations))
+                        sam3_model, image[b], m, box, H, W, device, dtype, refine_iterations))
 
             all_bbox_dicts.append(frame_bbox_dicts)
             if len(frame_masks) > 0:
@@ -258,43 +243,65 @@ class SAM3_Detect(io.ComfyNode):
 
 SAM3TrackData = io.Custom("SAM3_TRACK_DATA")
 
-# 5x3 bitmap font for digits 0-9 (each digit is 5 rows of 3-bit patterns)
-_DIGIT_BITMAPS = [
-    [7,5,5,5,7], [2,6,2,2,7], [7,1,7,4,7], [7,1,7,1,7], [5,5,7,1,1],
-    [7,4,7,1,7], [7,4,7,5,7], [7,1,1,1,1], [7,5,7,5,7], [7,5,7,1,7],
-]
+# 5x3 bitmap font atlas for digits 0-9 [10, 5, 3]
+_DIGIT_ATLAS = torch.tensor([
+    [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]],
+    [[0,1,0],[1,1,0],[0,1,0],[0,1,0],[1,1,1]],
+    [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]],
+    [[1,1,1],[0,0,1],[1,1,1],[0,0,1],[1,1,1]],
+    [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]],
+    [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]],
+    [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]],
+    [[1,1,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]],
+    [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]],
+    [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]],
+], dtype=torch.bool)
 
-def _draw_number(img, number, cx, cy, color, scale=3):
-    """Draw a number on a numpy image [H, W, 3] at (cx, cy) with colored text and dark outline."""
-    H, W = img.shape[:2]
-    digits = str(number)
-    total_w = len(digits) * 4 * scale - scale
+_GLYPH_CACHE = {}  # (device, scale) -> (glyphs, outlines, gh, gw, oh, ow)
+
+def _get_glyphs(device, scale=3):
+    key = (device, scale)
+    if key in _GLYPH_CACHE:
+        return _GLYPH_CACHE[key]
+    atlas = _DIGIT_ATLAS.to(device)
+    glyphs, outlines = [], []
+    for d in range(10):
+        g = atlas[d].repeat_interleave(scale, 0).repeat_interleave(scale, 1)
+        padded = F.pad(g.float().unsqueeze(0).unsqueeze(0), (1,1,1,1))
+        o = (F.max_pool2d(padded, 3, stride=1, padding=1)[0, 0] > 0)
+        glyphs.append(g)
+        outlines.append(o)
+    gh, gw = glyphs[0].shape
+    oh, ow = outlines[0].shape
+    _GLYPH_CACHE[key] = (glyphs, outlines, gh, gw, oh, ow)
+    return _GLYPH_CACHE[key]
+
+def _draw_number_gpu(frame, number, cx, cy, color, scale=3):
+    """Draw a number on a GPU tensor [H, W, 3] uint8 at (cx, cy) with outline."""
+    H, W = frame.shape[:2]
+    device = frame.device
+    glyphs, outlines, gh, gw, oh, ow = _get_glyphs(device, scale)
+    color_t = torch.tensor([int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)],
+                           device=device, dtype=frame.dtype)
+    digs = [int(d) for d in str(number)]
+    total_w = len(digs) * (gw + scale) - scale
     x0 = cx - total_w // 2
-    y0 = cy - 5 * scale // 2
-    outline_pts, fill_pts = [], []
-    for di, ch in enumerate(digits):
-        bm = _DIGIT_BITMAPS[int(ch)]
-        dx = x0 + di * 4 * scale
-        for row in range(5):
-            for col in range(3):
-                if not (bm[row] & (4 >> col)):
-                    continue
-                for sy in range(scale):
-                    for sx in range(scale):
-                        py = y0 + row * scale + sy
-                        px = dx + col * scale + sx
-                        for oy in range(-1, 2):
-                            for ox in range(-1, 2):
-                                yy, xx = py + oy, px + ox
-                                if 0 <= yy < H and 0 <= xx < W:
-                                    outline_pts.append((yy, xx))
-                        if 0 <= py < H and 0 <= px < W:
-                            fill_pts.append((py, px))
-    rgb = [int(c * 255) for c in color]
-    for y, x in outline_pts:
-        img[y, x] = [0, 0, 0]
-    for y, x in fill_pts:
-        img[y, x] = rgb
+    y0 = cy - gh // 2
+    for i, d in enumerate(digs):
+        dx = x0 + i * (gw + scale)
+        # Black outline
+        oy0, ox0 = y0 - 1, dx - 1
+        osy1, osx1 = max(0, -oy0), max(0, -ox0)
+        osy2, osx2 = min(oh, H - oy0), min(ow, W - ox0)
+        if osy2 > osy1 and osx2 > osx1:
+            fy1, fx1 = oy0 + osy1, ox0 + osx1
+            frame[fy1:fy1+(osy2-osy1), fx1:fx1+(osx2-osx1)][outlines[d][osy1:osy2, osx1:osx2]] = 0
+        # Colored fill
+        sy1, sx1 = max(0, -y0), max(0, -dx)
+        sy2, sx2 = min(gh, H - y0), min(gw, W - dx)
+        if sy2 > sy1 and sx2 > sx1:
+            fy1, fx1 = y0 + sy1, dx + sx1
+            frame[fy1:fy1+(sy2-sy1), fx1:fx1+(sx2-sx1)][glyphs[d][sy1:sy2, sx1:sx2]] = color_t
 
 
 
@@ -346,13 +353,12 @@ class SAM3_VideoTrack(io.ComfyNode):
         elif initial_mask is None:
             raise ValueError("Either initial_mask or conditioning must be provided")
 
-        mask_logits = sam3_model.forward_video(
+        result = sam3_model.forward_video(
             images=frames_in, initial_masks=init_masks, pbar=pbar, text_prompts=text_prompts,
             new_det_thresh=detection_threshold, max_objects=max_objects,
             detect_interval=detect_interval)
-
-        # mask_logits: [N, N_obj, 1008, 1008] on intermediate device
-        return io.NodeOutput({"logits": mask_logits, "orig_size": (H, W)})
+        result["orig_size"] = (H, W)
+        return io.NodeOutput(result)
 
 
 class SAM3_TrackPreview(io.ComfyNode):
@@ -381,63 +387,65 @@ class SAM3_TrackPreview(io.ComfyNode):
 
     @classmethod
     def execute(cls, track_data, images=None, opacity=0.5, fps=24.0) -> io.NodeOutput:
-        import av
-        from fractions import Fraction
 
-        logits = track_data["logits"]  # [N, N_obj, H_model, W_model]
-        N, N_obj = logits.shape[:2]
+        masks = track_data["masks"]  # [N, N_obj, H_model, W_model] uint8 or None
         H, W = track_data["orig_size"]
         if images is not None:
             H, W = images.shape[1], images.shape[2]
+        if masks is None:
+            N, N_obj = track_data["n_frames"], 0
+        else:
+            N, N_obj = masks.shape[0], masks.shape[1]
 
-        # Compute centroids at model resolution (cheap), scale to output coords
-        Hm, Wm = logits.shape[-2:]
-        cy_np, cx_np, has_np = None, None, None
-        if N_obj > 0:
-            binary = logits > 0  # [N, N_obj, Hm, Wm] — model res, no upscale
-            grid_y = torch.arange(Hm, device=logits.device).float().view(1, 1, Hm, 1)
-            grid_x = torch.arange(Wm, device=logits.device).float().view(1, 1, 1, Wm)
-            area = binary.sum(dim=(-1, -2)).float().clamp(min=1)
-            cy_np = ((binary * grid_y).sum(dim=(-1, -2)).float() / area * H / Hm).int().cpu().numpy()
-            cx_np = ((binary * grid_x).sum(dim=(-1, -2)).float() / area * W / Wm).int().cpu().numpy()
-            has_np = (area > 1).cpu().numpy()
-
-        # Write frames one at a time — upscale per frame, encode, discard
+        gpu = comfy.model_management.get_torch_device()
         temp_dir = folder_paths.get_temp_directory()
         filename = "sam3_track_preview.mp4"
         filepath = os.path.join(temp_dir, filename)
-        colors_np = [(int(r * 255), int(g * 255), int(b * 255)) for r, g, b in cls.COLORS]
         with av.open(filepath, mode='w') as output:
             stream = output.add_stream('h264', rate=Fraction(round(fps * 1000), 1000))
             stream.width = W
             stream.height = H
             stream.pix_fmt = 'yuv420p'
 
+            a = int(opacity * 255)
+            if N_obj > 0:
+                colors_t = torch.tensor([[int(r * 255), int(g * 255), int(b * 255)]
+                                        for r, g, b in [cls.COLORS[i % len(cls.COLORS)] for i in range(N_obj)]],
+                                       device=gpu, dtype=torch.uint8)
+                grid_y = torch.arange(H, device=gpu).view(1, H, 1)
+                grid_x = torch.arange(W, device=gpu).view(1, 1, W)
             for t in range(N):
                 if images is not None:
-                    frame_np = (images[t] * 255).clamp(0, 255).byte().cpu().numpy()
+                    frame = (images[t] * 255).clamp(0, 255).byte()
                 else:
-                    frame_np = np.zeros((H, W, 3), dtype=np.uint8)
+                    frame = torch.zeros(H, W, 3, dtype=torch.uint8)
 
                 if N_obj > 0:
-                    # Upscale this frame's masks only
-                    frame_masks = F.interpolate(logits[t:t+1].float(), size=(H, W),
-                                               mode="bilinear", align_corners=False)[0]  # [N_obj, H, W]
+                    frame_masks = F.interpolate(masks[t:t+1].to(gpu).float(), size=(H, W), mode="nearest")[0]
+                    frame_gpu = frame.to(gpu)
+                    bool_masks = frame_masks > 0.5
+                    any_mask = bool_masks.any(dim=0)
+                    if any_mask.any():
+                        obj_idx_map = bool_masks.to(torch.uint8).argmax(dim=0)
+                        color_overlay = colors_t[obj_idx_map]
+                        mask_3d = any_mask.unsqueeze(-1)
+                        blended = (frame_gpu.short() * (255 - a) + color_overlay.short() * a) // 255
+                        frame_gpu = torch.where(mask_3d, blended.to(torch.uint8), frame_gpu)
+                    area = bool_masks.sum(dim=(-1, -2)).clamp(min=1)
+                    cy = (bool_masks * grid_y).sum(dim=(-1, -2)) // area
+                    cx = (bool_masks * grid_x).sum(dim=(-1, -2)) // area
+                    has = area > 1
                     for obj_idx in range(N_obj):
-                        m = frame_masks[obj_idx].cpu().numpy() > 0
-                        if not m.any():
-                            continue
-                        r, g, b = colors_np[obj_idx % len(colors_np)]
-                        fg = frame_np[m].astype(np.float32)
-                        frame_np[m] = (fg * (1 - opacity) + opacity * np.array([r, g, b], dtype=np.float32)).clip(0, 255).astype(np.uint8)
-                        if has_np is not None and has_np[t, obj_idx]:
-                            _draw_number(frame_np, obj_idx, int(cx_np[t, obj_idx]), int(cy_np[t, obj_idx]),
-                                         cls.COLORS[obj_idx % len(cls.COLORS)])
+                        if has[obj_idx]:
+                            _draw_number_gpu(frame_gpu, obj_idx, int(cx[obj_idx]), int(cy[obj_idx]),
+                                             cls.COLORS[obj_idx % len(cls.COLORS)])
+                    frame_np = frame_gpu.cpu().numpy()
+                else:
+                    frame_np = frame.numpy()
 
                 vframe = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
                 output.mux(stream.encode(vframe.reformat(format='yuv420p')))
             output.mux(stream.encode(None))
-
         return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(filename, "", io.FolderType.temp)]))
 
 
@@ -462,14 +470,15 @@ class SAM3_TrackToMask(io.ComfyNode):
 
     @classmethod
     def execute(cls, track_data, object_indices="") -> io.NodeOutput:
-        logits = track_data["logits"]  # [N, N_obj, H_model, W_model]
+        masks = track_data["masks"]  # [N, N_obj, H_model, W_model] uint8 or None
         H, W = track_data["orig_size"]
-        N, N_obj = logits.shape[:2]
 
-        if N_obj == 0:
+        if masks is None:
+            N = track_data["n_frames"]
             return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
 
-        # Parse object indices
+        N, N_obj = masks.shape[0], masks.shape[1]
+
         if object_indices.strip():
             indices = [int(i.strip()) for i in object_indices.split(",") if i.strip().isdigit()]
             indices = [i for i in indices if 0 <= i < N_obj]
@@ -479,20 +488,9 @@ class SAM3_TrackToMask(io.ComfyNode):
         if not indices:
             return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
 
-        selected = logits[:, indices]  # [N, len(indices), H_model, W_model]
-
-        # Non-overlapping suppression at model resolution
-        if len(indices) > 1:
-            for t in range(N):
-                obj_masks = selected[t]
-                max_obj = torch.argmax(obj_masks, dim=0, keepdim=True)
-                batch_inds = torch.arange(len(indices), device=obj_masks.device)[:, None, None]
-                keep = (max_obj == batch_inds)
-                selected[t] = torch.where(keep, obj_masks, torch.clamp(obj_masks, max=-10.0))
-
-        # Union + upscale
-        mask_out = (selected.amax(dim=1, keepdim=True) > -1.0).float()
-        mask_out = F.interpolate(mask_out, size=(H, W), mode="bilinear", align_corners=False)[:, 0]
+        selected = masks[:, indices]  # [N, len(indices), Hm, Wm] uint8
+        union = selected.any(dim=1, keepdim=True).float()  # [N, 1, Hm, Wm]
+        mask_out = F.interpolate(union, size=(H, W), mode="bilinear", align_corners=False)[:, 0]
         return io.NodeOutput(mask_out)
 
 

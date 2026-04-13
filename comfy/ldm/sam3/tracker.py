@@ -1736,7 +1736,10 @@ class SAM31Tracker(nn.Module):
                     if keep_alive.get(i, 0) <= 0:
                         masks_out[i] = NO_OBJ_SCORE
             N_obj_now = mux_state.total_valid_entries if mux_state is not None else 0
-            all_masks.append(masks_out.to(idev) if N_obj_now > 0 else empty())
+            if N_obj_now > 0:
+                all_masks.append((masks_out > 0).byte().to(idev))
+            else:
+                all_masks.append(None)
             if pbar is not None:
                 pbar.update(1)
 
@@ -1748,13 +1751,16 @@ class SAM31Tracker(nn.Module):
                 else:
                     cur_bb = self._compute_backbone_frame(backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
 
-        if not all_masks or all(m.shape[0] == 0 for m in all_masks):
-            return torch.zeros(N, 0, self.image_size, self.image_size, device=idev, dtype=dt)
+        if not all_masks or all(m is None for m in all_masks):
+            return {"masks": None, "n_frames": N}
 
-        # Post-pad: frames before an object appeared get NO_OBJ_SCORE
-        max_obj = max(m.shape[0] for m in all_masks)
+        max_obj = max(m.shape[0] for m in all_masks if m is not None)
+        sample = next(m for m in all_masks if m is not None)
+        empty_mask = torch.zeros(max_obj, *sample.shape[1:], dtype=torch.uint8, device=sample.device)
         for i, m in enumerate(all_masks):
-            if m.shape[0] < max_obj:
-                pad = torch.full((max_obj - m.shape[0], *m.shape[1:]), NO_OBJ_SCORE, device=m.device, dtype=m.dtype)
+            if m is None:
+                all_masks[i] = empty_mask
+            elif m.shape[0] < max_obj:
+                pad = torch.zeros(max_obj - m.shape[0], *m.shape[1:], dtype=torch.uint8, device=m.device)
                 all_masks[i] = torch.cat([m, pad], dim=0)
-        return torch.stack(all_masks, dim=0)
+        return {"masks": torch.stack(all_masks, dim=0), "n_frames": N}
