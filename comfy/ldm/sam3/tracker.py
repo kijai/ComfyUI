@@ -198,10 +198,10 @@ def pack_masks(masks):
     return (binary.view(*masks.shape[:-1], -1, 8) * (1 << shifts)).sum(-1).byte()
 
 
-def unpack_masks(packed, W):
-    """Unpack bit-packed [*, H, W//8] uint8 to bool [*, H, W]."""
+def unpack_masks(packed):
+    """Unpack bit-packed [*, H, W//8] uint8 to bool [*, H, W*8]."""
     shifts = torch.arange(8, device=packed.device)
-    return ((packed.unsqueeze(-1) >> shifts) & 1).view(*packed.shape[:-1], -1)[..., :W].bool()
+    return ((packed.unsqueeze(-1) >> shifts) & 1).view(*packed.shape[:-1], -1).bool()
 
 
 def _compute_backbone(backbone_fn, frame, frame_idx=None):
@@ -1575,7 +1575,7 @@ class SAM31Tracker(nn.Module):
             if keep_alive is not None:
                 for i in range(N_obj):
                     keep_alive[i] = max(-4, keep_alive.get(i, 0) - 1)
-            return
+            return []
 
         # Match at low-res (like reference)
         trk_masks = current_out["pred_masks"][:, 0]  # [N_obj, H_low, W_low]
@@ -1617,7 +1617,7 @@ class SAM31Tracker(nn.Module):
 
         # Add new detections (not matching any track)
         if max_objects > 0 and N_obj >= max_objects:
-            return
+            return []
         max_overlap = overlap.max(dim=1)[0] if overlap.shape[1] > 0 else torch.zeros(overlap.shape[0], device=device)
         new_dets = max_overlap < 0.5
         if new_dets.any():
@@ -1629,6 +1629,8 @@ class SAM31Tracker(nn.Module):
             if keep_alive is not None:
                 for i in range(N_obj, mux_state.total_valid_entries):
                     keep_alive[i] = 1
+            return det_scores[new_dets].tolist() if det_scores is not None else [0.0] * new_dets.sum().item()
+        return []
 
     def track_video_with_detection(self, backbone_fn, images, initial_masks, detect_fn=None,
                                    new_det_thresh=0.5, max_objects=0, detect_interval=1,
@@ -1642,6 +1644,7 @@ class SAM31Tracker(nn.Module):
         mux_state = None
         if initial_masks is not None:
             mux_state = MultiplexState(initial_masks.shape[0], self.num_multiplex, device, dt)
+        obj_scores = []  # per-object detection score (1.0 for initial masks)
         keep_alive = {} if detect_fn is not None else None
         last_occluded = torch.empty(0, device=device, dtype=torch.long)  # per-object last occluded frame
 
@@ -1687,12 +1690,14 @@ class SAM31Tracker(nn.Module):
                     feat_sizes, high_res_prop, output_dict, N, mux_state, backbone_obj,
                     images[frame_idx:frame_idx + 1], trunk_out)
                 last_occluded = torch.full((mux_state.total_valid_entries,), -1, device=device, dtype=torch.long)
+                obj_scores = [1.0] * mux_state.total_valid_entries
                 if keep_alive is not None:
                     for i in range(mux_state.total_valid_entries):
                         keep_alive[i] = 8
             elif mux_state is None or mux_state.total_valid_entries == 0:
                 if det_masks.shape[0] > 0:
                     if max_objects > 0:
+                        det_scores = det_scores[:max_objects]
                         det_masks = det_masks[:max_objects]
                     mux_state = MultiplexState(det_masks.shape[0], self.num_multiplex, device, dt)
                     current_out = self._condition_with_masks(
@@ -1700,6 +1705,7 @@ class SAM31Tracker(nn.Module):
                         output_dict, N, mux_state, backbone_obj,
                         images[frame_idx:frame_idx + 1], trunk_out, threshold=0.0)
                     last_occluded = torch.full((mux_state.total_valid_entries,), -1, device=device, dtype=torch.long)
+                    obj_scores = det_scores[:mux_state.total_valid_entries].tolist()
                     if keep_alive is not None:
                         for i in range(mux_state.total_valid_entries):
                             keep_alive[i] = 1
@@ -1735,13 +1741,14 @@ class SAM31Tracker(nn.Module):
                     if old_idx < frame_idx - lookback:
                         del output_dict["non_cond_frame_outputs"][old_idx]
                 n_before = mux_state.total_valid_entries
-                self._match_and_add_detections(det_masks, det_scores, current_out, mux_state,
+                new_obj_scores = self._match_and_add_detections(det_masks, det_scores, current_out, mux_state,
                                                vision_feats, feat_sizes, device, max_objects,
                                                keep_alive if run_det else None)
                 n_added = mux_state.total_valid_entries - n_before
                 if n_added > 0:
                     last_occluded = torch.cat([last_occluded,
                         torch.full((n_added,), -1, device=device, dtype=torch.long)])
+                    obj_scores.extend(new_obj_scores)
 
             masks_out = current_out["pred_masks_high_res"][:, 0]
             if keep_alive is not None:
@@ -1765,7 +1772,7 @@ class SAM31Tracker(nn.Module):
                     cur_bb = self._compute_backbone_frame(backbone_fn, images[frame_idx + 1:frame_idx + 2], frame_idx=frame_idx + 1)
 
         if not all_masks or all(m is None for m in all_masks):
-            return {"packed": None, "mask_w": self.image_size, "n_frames": N, "mask_h": self.image_size}
+            return {"packed_masks": None, "n_frames": N, "scores": []}
 
         max_obj = max(m.shape[0] for m in all_masks if m is not None)
         sample = next(m for m in all_masks if m is not None)
@@ -1776,4 +1783,4 @@ class SAM31Tracker(nn.Module):
             elif m.shape[0] < max_obj:
                 pad = torch.zeros(max_obj - m.shape[0], *m.shape[1:], dtype=torch.uint8, device=m.device)
                 all_masks[i] = torch.cat([m, pad], dim=0)
-        return {"packed": torch.stack(all_masks, dim=0), "mask_w": self.image_size, "n_frames": N}
+        return {"packed_masks": torch.stack(all_masks, dim=0), "n_frames": N, "scores": obj_scores}

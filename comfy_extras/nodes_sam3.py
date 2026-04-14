@@ -386,8 +386,7 @@ class SAM3_TrackPreview(io.ComfyNode):
     def execute(cls, track_data, images=None, opacity=0.5, fps=24.0) -> io.NodeOutput:
 
         from comfy.ldm.sam3.tracker import unpack_masks
-        packed = track_data["packed"]  # [N, N_obj, H, W_packed] uint8 or None
-        mask_w = track_data["mask_w"]
+        packed = track_data["packed_masks"]
         H, W = track_data["orig_size"]
         if images is not None:
             H, W = images.shape[1], images.shape[2]
@@ -420,7 +419,7 @@ class SAM3_TrackPreview(io.ComfyNode):
                     frame = torch.zeros(H, W, 3)
 
                 if N_obj > 0:
-                    frame_binary = unpack_masks(packed[t:t+1].to(gpu), mask_w)  # [1, N_obj, H, W] bool
+                    frame_binary = unpack_masks(packed[t:t+1].to(gpu))  # [1, N_obj, H, W] bool
                     frame_masks = F.interpolate(frame_binary.float(), size=(H, W), mode="nearest")[0]
                     frame_gpu = frame.to(gpu)
                     bool_masks = frame_masks > 0.5
@@ -434,10 +433,15 @@ class SAM3_TrackPreview(io.ComfyNode):
                     cy = (bool_masks * grid_y).sum(dim=(-1, -2)) // area
                     cx = (bool_masks * grid_x).sum(dim=(-1, -2)) // area
                     has = area > 1
+                    scores = track_data.get("scores", [])
                     for obj_idx in range(N_obj):
                         if has[obj_idx]:
-                            SAM3_TrackPreview._draw_number_gpu(frame_gpu, obj_idx, int(cx[obj_idx]), int(cy[obj_idx]),
-                                             cls.COLORS[obj_idx % len(cls.COLORS)])
+                            _cx, _cy = int(cx[obj_idx]), int(cy[obj_idx])
+                            color = cls.COLORS[obj_idx % len(cls.COLORS)]
+                            SAM3_TrackPreview._draw_number_gpu(frame_gpu, obj_idx, _cx, _cy, color)
+                            if obj_idx < len(scores) and scores[obj_idx] < 1.0:
+                                SAM3_TrackPreview._draw_number_gpu(frame_gpu, int(scores[obj_idx] * 100),
+                                                                   _cx, _cy + 5 * 3 + 3, color, scale=2)
                     frame_cpu.copy_(frame_gpu.clamp_(0, 1).mul_(255).byte())
                 else:
                     frame_cpu.copy_(frame.clamp_(0, 1).mul_(255).byte())
@@ -470,8 +474,7 @@ class SAM3_TrackToMask(io.ComfyNode):
     @classmethod
     def execute(cls, track_data, object_indices="") -> io.NodeOutput:
         from comfy.ldm.sam3.tracker import unpack_masks
-        packed = track_data["packed"]
-        mask_w = track_data["mask_w"]
+        packed = track_data["packed_masks"]
         H, W = track_data["orig_size"]
 
         if packed is None:
@@ -490,7 +493,7 @@ class SAM3_TrackToMask(io.ComfyNode):
             return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
 
         selected = packed[:, indices]
-        binary = unpack_masks(selected, mask_w)  # [N, len(indices), Hm, Wm] bool
+        binary = unpack_masks(selected)  # [N, len(indices), Hm, Wm] bool
         union = binary.any(dim=1, keepdim=True).float()
         mask_out = F.interpolate(union, size=(H, W), mode="bilinear", align_corners=False)[:, 0]
         return io.NodeOutput(mask_out)
