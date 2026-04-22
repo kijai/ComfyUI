@@ -193,12 +193,9 @@ class SaveVideoAdvanced(io.ComfyNode):
                 "sequence (one .exr per frame) with optional mask as alpha."
             ),
             inputs=[
-                io.Image.Input("image", tooltip="Image sequence to save. Batch dimension becomes frame count."),
+                io.Video.Input("video", tooltip="The video to save."),
                 io.String.Input("filename_prefix", default="video/ComfyUI",
                     tooltip="Prefix for the output file(s). Supports %date:...% and %node.field% expansion.",
-                ),
-                io.Float.Input("fps", default=24.0, min=0.01, max=1000.0, step=0.01,
-                    tooltip="Frame rate. Used by video encoders; for EXR it's tagged in the image2 muxer (most EXR tools ignore it).",
                 ),
                 io.DynamicCombo.Input("codec",
                     tooltip=(
@@ -241,18 +238,18 @@ class SaveVideoAdvanced(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, image: torch.Tensor, filename_prefix: str, fps: float, codec: dict) -> io.NodeOutput:
+    def execute(cls, video: Input.Video, filename_prefix: str, codec: dict) -> io.NodeOutput:
         codec_name = codec["codec"]
         mask = codec.get("mask")
-        _, height, width, _ = image.shape
+        width, height = video.get_dimensions()
 
         if mask is not None and mask.shape[-2:] != (height, width):
             raise ValueError(
-                f"mask resolution {tuple(mask.shape[-2:])} does not match image "
+                f"mask resolution {tuple(mask.shape[-2:])} does not match video "
                 f"resolution ({height}, {width})."
             )
 
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix, folder_paths.get_output_directory(), width, height)
 
         saved_metadata = None
@@ -266,11 +263,12 @@ class SaveVideoAdvanced(io.ComfyNode):
                 saved_metadata = metadata
 
         if codec_name == "exr":
+            components = video.get_components()
             file_pattern = f"{filename}_{counter:05}_%04d.exr"
             _write_exr_sequence(
-                image.float(),
+                components.images.float(),
                 os.path.join(full_output_folder, file_pattern),
-                fps,
+                float(components.frame_rate),
                 mask=mask.float() if mask is not None else None,
             )
             return io.NodeOutput(ui=ui.PreviewVideo([]))
@@ -296,9 +294,16 @@ class SaveVideoAdvanced(io.ComfyNode):
                 }
         else:
             container = Types.VideoContainer.MOV
-        images = _image_with_alpha(image, mask) if mask is not None else image
-        components = Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(fps))
-        video = InputImpl.VideoFromComponents(components)
+
+        if mask is not None:
+            # Splice alpha plane onto images; preserves original audio / fps.
+            orig = video.get_components()
+            video = InputImpl.VideoFromComponents(Types.VideoComponents(
+                images=_image_with_alpha(orig.images, mask),
+                audio=orig.audio,
+                frame_rate=orig.frame_rate,
+            ))
+
         file = f"{filename}_{counter:05}_.{Types.VideoContainer.get_extension(container)}"
         video.save_to(
             os.path.join(full_output_folder, file),
@@ -307,7 +312,10 @@ class SaveVideoAdvanced(io.ComfyNode):
             metadata=saved_metadata,
             encoder_options=encoder_options,
         )
-        return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
+        # Some codecs can't preview anything meaningful in the browser, todo: make frontend clear the preview on invalid input
+        if codec_name == "h265_main10":
+            return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
+        return io.NodeOutput(ui=ui.PreviewVideo([]))
 
 
 class CreateVideo(io.ComfyNode):
