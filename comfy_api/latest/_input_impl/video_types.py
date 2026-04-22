@@ -14,6 +14,49 @@ import torch
 from .._util import VideoContainer, VideoCodec, VideoComponents
 
 
+# rgb48le input is required for ProRes/DNxHR to carry real 10-bit precision;
+# rgb24 pre-quantizes to 8-bit before sws_scale.
+_CODEC_SETTINGS: dict[VideoCodec, dict] = {
+    VideoCodec.H264: {
+        "encoder": "h264",
+        "input_pix_fmt": "rgb24",
+        "pix_fmt": "yuv420p",
+        "options": {},
+        "default_container": VideoContainer.MP4,
+    },
+    VideoCodec.PRORES_4444: {
+        "encoder": "prores_ks",
+        "input_pix_fmt": "rgb48le",
+        "pix_fmt": "yuv444p10le",
+        "alpha_input_pix_fmt": "rgba64le",
+        "alpha_pix_fmt": "yuva444p10le",
+        "options": {"profile": "4"},
+        "default_container": VideoContainer.MOV,
+    },
+    VideoCodec.DNXHR_HQX: {
+        "encoder": "dnxhd",
+        "input_pix_fmt": "rgb48le",
+        "pix_fmt": "yuv422p10le",
+        "options": {"profile": "dnxhr_hqx"},
+        "default_container": VideoContainer.MOV,
+    },
+    VideoCodec.DNXHR_444: {
+        "encoder": "dnxhd",
+        "input_pix_fmt": "rgb48le",
+        "pix_fmt": "yuv444p10le",
+        "options": {"profile": "dnxhr_444"},
+        "default_container": VideoContainer.MOV,
+    },
+    VideoCodec.H265_MAIN10: {
+        "encoder": "libx265",
+        "input_pix_fmt": "rgb48le",
+        "pix_fmt": "yuv420p10le",
+        "options": {"profile": "main10"},
+        "default_container": VideoContainer.MP4,
+    },
+}
+
+
 def container_to_output_format(container_format: str | None) -> str | None:
     """
     A container's `format` may be a comma-separated list of formats.
@@ -310,6 +353,7 @@ class VideoFromFile(VideoInput):
         format: VideoContainer = VideoContainer.AUTO,
         codec: VideoCodec = VideoCodec.AUTO,
         metadata: Optional[dict] = None,
+        encoder_options: Optional[dict] = None,
     ):
         if isinstance(self.__file, io.BytesIO):
             self.__file.seek(0)  # Reset the BytesIO object to the beginning
@@ -323,12 +367,20 @@ class VideoFromFile(VideoInput):
                 reuse_streams = False
             if self.__start_time or self.__duration:
                 reuse_streams = False
+            # encoder_options only applies to the re-encode path; forcing it
+            # would otherwise require re-encoding when we'd rather just remux.
+            if encoder_options:
+                reuse_streams = False
 
             if not reuse_streams:
                 components = self.get_components_internal(container)
                 video = VideoFromComponents(components)
                 return video.save_to(
-                    path, format=format, codec=codec, metadata=metadata
+                    path,
+                    format=format,
+                    codec=codec,
+                    metadata=metadata,
+                    encoder_options=encoder_options,
                 )
 
             streams = container.streams
@@ -400,19 +452,34 @@ class VideoFromComponents(VideoInput):
         format: VideoContainer = VideoContainer.AUTO,
         codec: VideoCodec = VideoCodec.AUTO,
         metadata: Optional[dict] = None,
+        encoder_options: Optional[dict] = None,
     ):
-        """Save the video to a file path or BytesIO buffer."""
-        if format != VideoContainer.AUTO and format != VideoContainer.MP4:
-            raise ValueError("Only MP4 format is supported for now")
-        if codec != VideoCodec.AUTO and codec != VideoCodec.H264:
-            raise ValueError("Only H264 codec is supported for now")
+        """Save the video to a file path or BytesIO buffer.
+
+        `encoder_options` merges into the codec's baseline options on the video
+        stream (e.g. `x265-params` for HDR10 tagging).
+        """
+        if isinstance(codec, str):
+            codec = VideoCodec(codec)
+        if codec == VideoCodec.AUTO:
+            codec = VideoCodec.H264
+        settings = _CODEC_SETTINGS.get(codec)
+        if settings is None:
+            raise ValueError(f"Unsupported codec: {codec}")
+
+        if isinstance(format, str):
+            format = VideoContainer(format)
+        explicit_format = format != VideoContainer.AUTO
+        if format == VideoContainer.AUTO:
+            format = settings["default_container"]
+
+        # Force the muxer explicitly for BytesIO (no extension to infer from)
+        # and when the caller asked for a specific container. For AUTO + file
+        # path, let ffmpeg infer from the extension so callers that rely on
+        # extension-based muxer selection keep working.
         extra_kwargs = {}
-        if isinstance(format, VideoContainer) and format != VideoContainer.AUTO:
-            extra_kwargs["format"] = format.value
-        elif isinstance(path, io.BytesIO):
-            # BytesIO has no file extension, so av.open can't infer the format.
-            # Default to mp4 since that's the only supported format anyway.
-            extra_kwargs["format"] = "mp4"
+        if isinstance(path, io.BytesIO) or explicit_format:
+            extra_kwargs["format"] = format.to_ffmpeg_format()
         with av.open(path, mode='w', options={'movflags': 'use_metadata_tags'}, **extra_kwargs) as output:
             # Add metadata before writing any streams
             if metadata is not None:
@@ -421,10 +488,21 @@ class VideoFromComponents(VideoInput):
 
             frame_rate = Fraction(round(self.__components.frame_rate * 1000), 1000)
             # Create a video stream
-            video_stream = output.add_stream('h264', rate=frame_rate)
+            video_stream = output.add_stream(settings["encoder"], rate=frame_rate)
             video_stream.width = self.__components.images.shape[2]
             video_stream.height = self.__components.images.shape[1]
-            video_stream.pix_fmt = 'yuv420p'
+            # Route 4-channel input to the codec's alpha pix_fmts if it supports them.
+            has_alpha = self.__components.images.shape[-1] == 4 and "alpha_pix_fmt" in settings
+            if has_alpha:
+                input_pix_fmt = settings["alpha_input_pix_fmt"]
+                stream_pix_fmt = settings["alpha_pix_fmt"]
+            else:
+                input_pix_fmt = settings["input_pix_fmt"]
+                stream_pix_fmt = settings["pix_fmt"]
+            video_stream.pix_fmt = stream_pix_fmt
+            merged_options = {**settings["options"], **(encoder_options or {})}
+            if merged_options:
+                video_stream.options = merged_options
 
             # Create an audio stream
             audio_sample_rate = 1
@@ -436,11 +514,13 @@ class VideoFromComponents(VideoInput):
                 layout = {1: 'mono', 2: 'stereo', 6: '5.1'}.get(waveform.shape[0], 'stereo')
                 audio_stream = output.add_stream('aac', rate=audio_sample_rate, layout=layout)
 
-            # Encode video
             for i, frame in enumerate(self.__components.images):
-                img = (frame * 255).clamp(0, 255).byte().cpu().numpy() # shape: (H, W, 3)
-                frame = av.VideoFrame.from_ndarray(img, format='rgb24')
-                frame = frame.reformat(format='yuv420p')  # Convert to YUV420P as required by h264
+                if input_pix_fmt in ("rgb48le", "rgba64le"):
+                    img = frame.clamp(0.0, 1.0).mul_(65535.0).round_().cpu().numpy().astype(np.uint16)
+                else:
+                    img = (frame * 255).clamp_(0, 255).byte().cpu().numpy()
+                frame = av.VideoFrame.from_ndarray(img, format=input_pix_fmt)
+                frame = frame.reformat(format=stream_pix_fmt)
                 packet = video_stream.encode(frame)
                 output.mux(packet)
 

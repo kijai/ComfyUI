@@ -8,6 +8,7 @@ import json
 from typing import Optional
 from typing_extensions import override
 from fractions import Fraction
+import comfy.utils
 from comfy_api.latest import ComfyExtension, io, ui, Input, InputImpl, Types
 from comfy.cli_args import args
 
@@ -78,8 +79,8 @@ class SaveVideo(io.ComfyNode):
             inputs=[
                 io.Video.Input("video", tooltip="The video to save."),
                 io.String.Input("filename_prefix", default="video/ComfyUI", tooltip="The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes."),
-                io.Combo.Input("format", options=Types.VideoContainer.as_input(), default="auto", tooltip="The format to save the video as."),
-                io.Combo.Input("codec", options=Types.VideoCodec.as_input(), default="auto", tooltip="The codec to use for the video."),
+                io.Combo.Input("format", options=["auto", "mp4"], default="auto", tooltip="The format to save the video as."),
+                io.Combo.Input("codec", options=["auto", "h264"], default="auto", tooltip="The codec to use for the video."),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
             is_output_node=True,
@@ -111,6 +112,201 @@ class SaveVideo(io.ComfyNode):
             metadata=saved_metadata
         )
 
+        return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
+
+
+def _align_mask_to_image(mask: torch.Tensor, image_batch: int) -> torch.Tensor:
+    """Match mask batch to image batch; partial masks are zero-padded instead of looped."""
+    mask_batch = mask.shape[0]
+    if 1 < mask_batch < image_batch:
+        pad = torch.zeros(image_batch - mask_batch, *mask.shape[1:], dtype=mask.dtype, device=mask.device)
+        return torch.cat([mask, pad], dim=0)
+    return comfy.utils.repeat_to_batch_size(mask, image_batch)
+
+
+def _image_with_alpha(image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Concatenate mask onto a (B, H, W, 3) image as an alpha channel."""
+    mask = _align_mask_to_image(mask, image.shape[0])
+    alpha = mask.to(image.dtype).to(image.device).clamp(0.0, 1.0).unsqueeze(-1)
+    return torch.cat([image, alpha], dim=-1)
+
+
+def _write_exr_sequence(image: torch.Tensor, path_pattern: str, frame_rate, mask: torch.Tensor | None = None) -> None:
+    """Write an IMAGE tensor as a float32 EXR image sequence via FFmpeg's image2 muxer.
+    When `mask` is provided (shape (B, H, W) or (1, H, W)) its values become the alpha channel;
+    otherwise alpha is 1.0.
+    """
+    import numpy as np
+
+    batch, height, width, _ = image.shape
+    pix_fmt = "gbrapf32le"
+    itemsize = 4
+    default_alpha = np.ones((height, width), dtype=np.float32)
+    rate = Fraction(round(float(frame_rate) * 1000), 1000)
+    if mask is not None:
+        mask = _align_mask_to_image(mask, batch)
+
+    with av.open(path_pattern, mode="w", format="image2") as output:
+        stream = output.add_stream("exr", rate=rate)
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = pix_fmt
+
+        for i in range(batch):
+            gbr = image[i][..., [1, 2, 0]].permute(2, 0, 1).contiguous().cpu().numpy().astype(np.float32)
+            if mask is not None:
+                alpha = mask[i].clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
+            else:
+                alpha = default_alpha
+            planes_data = [gbr[0], gbr[1], gbr[2], alpha]
+
+            # from_ndarray doesn't support planar float formats; write planes directly.
+            av_frame = av.VideoFrame(width, height, pix_fmt)
+            for plane_idx in range(4):
+                plane = av_frame.planes[plane_idx]
+                line_samples = plane.line_size // itemsize
+                if line_samples == width:
+                    plane.update(planes_data[plane_idx].tobytes())
+                else:
+                    strided = np.zeros((height, line_samples), dtype=np.float32)
+                    strided[:, :width] = planes_data[plane_idx]
+                    plane.update(strided.tobytes())
+            for packet in stream.encode(av_frame):
+                output.mux(packet)
+
+        for packet in stream.encode(None):
+            output.mux(packet)
+
+
+class SaveVideoAdvanced(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SaveVideoAdvanced",
+            search_aliases=["save video advanced", "prores", "dnxhr", "exr", "hdr video", "hdr master"],
+            display_name="Save Video (Advanced)",
+            category="image/video",
+            description=(
+                "Save an image sequence with a pro codec. ProRes 4444 / DNxHR 444 / "
+                "DNxHR HQX produce 10-bit MOV video files. H.265 Main 10 produces "
+                "10-bit MP4 (HDR10-capable delivery). EXR writes a float32 image "
+                "sequence (one .exr per frame) with optional mask as alpha."
+            ),
+            inputs=[
+                io.Image.Input("image", tooltip="Image sequence to save. Batch dimension becomes frame count."),
+                io.String.Input("filename_prefix", default="video/ComfyUI",
+                    tooltip="Prefix for the output file(s). Supports %date:...% and %node.field% expansion.",
+                ),
+                io.Float.Input("fps", default=24.0, min=0.01, max=1000.0, step=0.01,
+                    tooltip="Frame rate. Used by video encoders; for EXR it's tagged in the image2 muxer (most EXR tools ignore it).",
+                ),
+                io.DynamicCombo.Input("codec",
+                    tooltip=(
+                        "prores_4444 / dnxhr_444: 10-bit 4:4:4 mastering (MOV). "
+                        "dnxhr_hqx: 10-bit 4:2:2 broadcast / HDR10 delivery (MOV). "
+                        "h265_main10: 10-bit 4:2:0 H.265 for HDR playback / streaming (MP4). "
+                        "exr: float32 linear-HDR image sequence (no clamping, values > 1.0 preserved)."
+                    ),
+                    options=[
+                        io.DynamicCombo.Option("dnxhr_444", []),
+                        io.DynamicCombo.Option("dnxhr_hqx", []),
+                        io.DynamicCombo.Option("h265_main10", [
+                            io.Combo.Input("container", options=["mp4", "mkv"], default="mp4",
+                                tooltip="MP4 for broadest compatibility (TVs, iOS, browsers). MKV for wider format flexibility and better handling of arbitrary timestamps.",
+                            ),
+                            io.Combo.Input("hdr_tagging", options=["off", "hdr10", "hlg"], default="off",
+                                tooltip=(
+                                    "off: no color tags (SDR or untagged HDR). "
+                                    "hdr10: BT.2020 + PQ (ST.2084) — standard HDR10 delivery. "
+                                    "hlg: BT.2020 + HLG (ARIB STD-B67) — broadcast / YouTube HLG. "
+                                    "Only set for actual HDR content; mis-tagging SDR causes wrong display on HDR TVs."
+                                ),
+                            ),
+                        ]),
+                        io.DynamicCombo.Option("prores_4444", [
+                            io.Mask.Input("mask", optional=True,
+                                tooltip="Optional alpha channel. Values in [0,1] become the ProRes 4444 alpha plane. Extra mask frames are sliced, missing frames are padded with zero (transparent) alpha.",
+                            ),
+                        ]),
+                        io.DynamicCombo.Option("exr", [
+                            io.Mask.Input("mask", optional=True,
+                                tooltip="Optional alpha channel. Values in [0,1] become EXR alpha. Extra mask frames are sliced, missing frames are padded with zero (transparent) alpha.",
+                            ),
+                        ]),
+                    ],
+                ),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, image: torch.Tensor, filename_prefix: str, fps: float, codec: dict) -> io.NodeOutput:
+        codec_name = codec["codec"]
+        mask = codec.get("mask")
+        _, height, width, _ = image.shape
+
+        if mask is not None and mask.shape[-2:] != (height, width):
+            raise ValueError(
+                f"mask resolution {tuple(mask.shape[-2:])} does not match image "
+                f"resolution ({height}, {width})."
+            )
+
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, folder_paths.get_output_directory(), width, height)
+
+        saved_metadata = None
+        if not args.disable_metadata:
+            metadata = {}
+            if cls.hidden.extra_pnginfo is not None:
+                metadata.update(cls.hidden.extra_pnginfo)
+            if cls.hidden.prompt is not None:
+                metadata["prompt"] = cls.hidden.prompt
+            if len(metadata) > 0:
+                saved_metadata = metadata
+
+        if codec_name == "exr":
+            file_pattern = f"{filename}_{counter:05}_%04d.exr"
+            _write_exr_sequence(
+                image.float(),
+                os.path.join(full_output_folder, file_pattern),
+                fps,
+                mask=mask.float() if mask is not None else None,
+            )
+            return io.NodeOutput(ui=ui.PreviewVideo([]))
+
+        # HDR tags go into x265-params for H.265; the actual RGB→YUV matrix is
+        # BT.709 (PyAV reformat doesn't expose bt2020) — subtle chroma shift
+        encoder_options = None
+        if codec_name == "h265_main10":
+            container = Types.VideoContainer(codec.get("container", "mp4"))
+            hdr_tagging = codec.get("hdr_tagging", "off")
+            if hdr_tagging == "hdr10":
+                # BT.2020 primaries / D65 WP; L(max,min) in 0.0001-nit units → 10000/0.0001 nits.
+                encoder_options = {
+                    "x265-params": (
+                        "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
+                        "hdr-opt=1:repeat-headers=1:"
+                        "master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(100000000,1)"
+                    ),
+                }
+            elif hdr_tagging == "hlg":
+                encoder_options = {
+                    "x265-params": "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:repeat-headers=1",
+                }
+        else:
+            container = Types.VideoContainer.MOV
+        images = _image_with_alpha(image, mask) if mask is not None else image
+        components = Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(fps))
+        video = InputImpl.VideoFromComponents(components)
+        file = f"{filename}_{counter:05}_.{Types.VideoContainer.get_extension(container)}"
+        video.save_to(
+            os.path.join(full_output_folder, file),
+            format=container,
+            codec=Types.VideoCodec(codec_name),
+            metadata=saved_metadata,
+            encoder_options=encoder_options,
+        )
         return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
 
 
@@ -262,6 +458,7 @@ class VideoExtension(ComfyExtension):
         return [
             SaveWEBM,
             SaveVideo,
+            SaveVideoAdvanced,
             CreateVideo,
             GetVideoComponents,
             LoadVideo,

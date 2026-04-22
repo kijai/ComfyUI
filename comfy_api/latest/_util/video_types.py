@@ -8,6 +8,10 @@ from .._input import ImageInput, AudioInput
 class VideoCodec(str, Enum):
     AUTO = "auto"
     H264 = "h264"
+    H265_MAIN10 = "h265_main10"
+    PRORES_4444 = "prores_4444"
+    DNXHR_HQX = "dnxhr_hqx"
+    DNXHR_444 = "dnxhr_444"
 
     @classmethod
     def as_input(cls) -> list[str]:
@@ -19,6 +23,8 @@ class VideoCodec(str, Enum):
 class VideoContainer(str, Enum):
     AUTO = "auto"
     MP4 = "mp4"
+    MOV = "mov"
+    MKV = "mkv"
 
     @classmethod
     def as_input(cls) -> list[str]:
@@ -34,9 +40,21 @@ class VideoContainer(str, Enum):
         """
         if isinstance(value, str):
             value = cls(value)
+        if value == VideoContainer.MOV:
+            return "mov"
+        if value == VideoContainer.MKV:
+            return "mkv"
         if value == VideoContainer.MP4 or value == VideoContainer.AUTO:
             return "mp4"
         return ""
+
+    def to_ffmpeg_format(self) -> str:
+        """Format string accepted by av.open()/ffmpeg. MKV's user-facing name
+        differs from the libavformat muxer name (matroska).
+        """
+        if self == VideoContainer.MKV:
+            return "matroska"
+        return self.value
 
 @dataclass
 class VideoComponents:

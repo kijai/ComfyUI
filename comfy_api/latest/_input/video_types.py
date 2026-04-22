@@ -27,7 +27,8 @@ class VideoInput(ABC):
         path: Union[str, IO[bytes]],
         format: VideoContainer = VideoContainer.AUTO,
         codec: VideoCodec = VideoCodec.AUTO,
-        metadata: Optional[dict] = None
+        metadata: Optional[dict] = None,
+        encoder_options: Optional[dict] = None, # passes extra encoder options (e.g. `x265-params`) through to the video stream.
     ):
         """
         Abstract method to save the video input to a file.
