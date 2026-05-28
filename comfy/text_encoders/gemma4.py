@@ -18,7 +18,7 @@ from comfy.text_encoders.llama import RMSNorm, MLP, BaseLlama, BaseGenerate, _ma
 
 
 GEMMA4_VISION_CONFIG = {"hidden_size": 768, "image_size": 896, "intermediate_size": 3072, "num_attention_heads": 12, "num_hidden_layers": 16, "patch_size": 16, "head_dim": 64, "rms_norm_eps": 1e-6, "position_embedding_size": 10240, "pooling_kernel_size": 3}
-GEMMA4_VISION_31B_CONFIG = {"hidden_size": 1152, "image_size": 896, "intermediate_size": 4304, "num_attention_heads": 16, "num_hidden_layers": 27, "patch_size": 16, "head_dim": 72, "rms_norm_eps": 1e-6, "position_embedding_size": 10240, "pooling_kernel_size": 3}
+GEMMA4_VISION_31B_CONFIG = {"hidden_size": 1152, "image_size": 896, "intermediate_size": 4304, "num_attention_heads": 16, "num_hidden_layers": 27, "patch_size": 16, "head_dim": 72, "rms_norm_eps": 1e-6, "position_embedding_size": 10240, "pooling_kernel_size": 3, "use_clipped_linears": False}
 GEMMA4_AUDIO_CONFIG = {"hidden_size": 1024, "num_hidden_layers": 12, "num_attention_heads": 8, "intermediate_size": 4096, "conv_kernel_size": 5, "attention_chunk_size": 12, "attention_context_left": 13, "attention_context_right": 0, "attention_logit_cap": 50.0, "output_proj_dims": 1536, "rms_norm_eps": 1e-6, "residual_weight": 0.5}
 
 @dataclass
@@ -35,6 +35,8 @@ class Gemma4Config:
     transformer_type: str = "gemma4"
     head_dim = 256
     global_head_dim = 512
+    num_global_key_value_heads = None
+    prefill_empty_thought = False
     rms_norm_add = False
     mlp_activation = "gelu_pytorch_tanh"
     qkv_bias = False
@@ -75,6 +77,8 @@ class Gemma4_31B_Config(Gemma4Config):
     sliding_attention = [1024, 1024, 1024, 1024, 1024, False]
     hidden_size_per_layer_input: int = 0
     num_kv_shared_layers: int = 0
+    num_global_key_value_heads = 4
+    prefill_empty_thought = True
     audio_config = None
     vision_config = GEMMA4_VISION_31B_CONFIG
 
@@ -89,10 +93,10 @@ def _apply_rotary_pos_emb(x, freqs_cis):
     return out
 
 class Gemma4Attention(nn.Module):
-    def __init__(self, config, head_dim, device=None, dtype=None, ops=None):
+    def __init__(self, config, head_dim, device=None, dtype=None, ops=None, num_kv_heads=None):
         super().__init__()
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else config.num_key_value_heads
         self.hidden_size = config.hidden_size
         self.head_dim = head_dim
         self.inner_size = self.num_heads * head_dim
@@ -185,8 +189,9 @@ class TransformerBlockGemma4(nn.Module):
             self.sliding_attention = False
 
         head_dim = config.head_dim if self.sliding_attention else config.global_head_dim
+        num_kv_heads = config.num_global_key_value_heads if (not self.sliding_attention and config.num_global_key_value_heads) else config.num_key_value_heads
 
-        self.self_attn = Gemma4Attention(config, head_dim=head_dim, device=device, dtype=dtype, ops=ops)
+        self.self_attn = Gemma4Attention(config, head_dim=head_dim, num_kv_heads=num_kv_heads, device=device, dtype=dtype, ops=ops)
 
         num_kv_shared = config.num_kv_shared_layers
         first_kv_shared = config.num_hidden_layers - num_kv_shared
@@ -203,9 +208,7 @@ class TransformerBlockGemma4(nn.Module):
             self.per_layer_input_gate = ops.Linear(config.hidden_size, self.hidden_size_per_layer_input, bias=False, device=device, dtype=dtype)
             self.per_layer_projection = ops.Linear(self.hidden_size_per_layer_input, config.hidden_size, bias=False, device=device, dtype=dtype)
             self.post_per_layer_input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device=device, dtype=dtype)
-            self.register_buffer("layer_scalar", torch.ones(1, device=device, dtype=dtype))
-        else:
-            self.layer_scalar = None
+        self.register_buffer("layer_scalar", torch.ones(1, device=device, dtype=dtype))
 
     def forward(self, x, attention_mask=None, freqs_cis=None, past_key_value=None, per_layer_input=None, shared_kv=None):
         sliding_window = None
@@ -244,8 +247,7 @@ class TransformerBlockGemma4(nn.Module):
             x = self.post_per_layer_input_norm(x)
             x = residual + x
 
-        if self.layer_scalar is not None:
-            x = x * self.layer_scalar
+        x = x * self.layer_scalar
 
         return x, present_key_value, shareable_kv
 
@@ -487,23 +489,27 @@ def _apply_vision_2d_rope(x, freqs):
 
 
 class ClippedLinear(nn.Module):
-    """Linear layer with activation clipping (from quantization-aware training).
+    """Linear layer with optional activation clipping (from quantization-aware training).
 
-    Stores input_max/min and output_max/min as buffers loaded from checkpoint.
+    When clipped=False the clamp buffers are not registered and forward is a plain Linear.
     """
-    def __init__(self, in_features, out_features, bias=False, device=None, dtype=None, ops=None):
+    def __init__(self, in_features, out_features, bias=False, device=None, dtype=None, ops=None, clipped=True):
         super().__init__()
         self.linear = ops.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
-        self.register_buffer('input_max', torch.tensor(float('inf'), device=device, dtype=dtype))
-        self.register_buffer('input_min', torch.tensor(float('-inf'), device=device, dtype=dtype))
-        self.register_buffer('output_max', torch.tensor(float('inf'), device=device, dtype=dtype))
-        self.register_buffer('output_min', torch.tensor(float('-inf'), device=device, dtype=dtype))
+        self.clipped = clipped
+        if clipped:
+            self.register_buffer('input_max', torch.tensor(float('inf'), device=device, dtype=dtype))
+            self.register_buffer('input_min', torch.tensor(float('-inf'), device=device, dtype=dtype))
+            self.register_buffer('output_max', torch.tensor(float('inf'), device=device, dtype=dtype))
+            self.register_buffer('output_min', torch.tensor(float('-inf'), device=device, dtype=dtype))
 
     @property
     def weight(self):
         return self.linear.weight
 
     def forward(self, x):
+        if not self.clipped:
+            return self.linear(x)
         x = x.clamp(min=self.input_min, max=self.input_max)
         x = self.linear(x)
         return x.clamp_(min=self.output_min, max=self.output_max)
@@ -515,9 +521,10 @@ class Gemma4VisionMLP(nn.Module):
         super().__init__()
         hidden_size = config["hidden_size"]
         intermediate_size = config["intermediate_size"]
-        self.gate_proj = ClippedLinear(hidden_size, intermediate_size, device=device, dtype=dtype, ops=ops)
-        self.up_proj = ClippedLinear(hidden_size, intermediate_size, device=device, dtype=dtype, ops=ops)
-        self.down_proj = ClippedLinear(intermediate_size, hidden_size, device=device, dtype=dtype, ops=ops)
+        clipped = config.get("use_clipped_linears", True)
+        self.gate_proj = ClippedLinear(hidden_size, intermediate_size, device=device, dtype=dtype, ops=ops, clipped=clipped)
+        self.up_proj = ClippedLinear(hidden_size, intermediate_size, device=device, dtype=dtype, ops=ops, clipped=clipped)
+        self.down_proj = ClippedLinear(intermediate_size, hidden_size, device=device, dtype=dtype, ops=ops, clipped=clipped)
 
     def forward(self, x):
         return self.down_proj(torch.nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
@@ -530,10 +537,11 @@ class Gemma4VisionAttention(nn.Module):
         self.num_heads = config["num_attention_heads"]
         self.head_dim = config.get("head_dim", self.hidden_size // self.num_heads)
 
-        self.q_proj = ClippedLinear(self.hidden_size, self.num_heads * self.head_dim, device=device, dtype=dtype, ops=ops)
-        self.k_proj = ClippedLinear(self.hidden_size, self.num_heads * self.head_dim, device=device, dtype=dtype, ops=ops)
-        self.v_proj = ClippedLinear(self.hidden_size, self.num_heads * self.head_dim, device=device, dtype=dtype, ops=ops)
-        self.o_proj = ClippedLinear(self.num_heads * self.head_dim, self.hidden_size, device=device, dtype=dtype, ops=ops)
+        clipped = config.get("use_clipped_linears", True)
+        self.q_proj = ClippedLinear(self.hidden_size, self.num_heads * self.head_dim, device=device, dtype=dtype, ops=ops, clipped=clipped)
+        self.k_proj = ClippedLinear(self.hidden_size, self.num_heads * self.head_dim, device=device, dtype=dtype, ops=ops, clipped=clipped)
+        self.v_proj = ClippedLinear(self.hidden_size, self.num_heads * self.head_dim, device=device, dtype=dtype, ops=ops, clipped=clipped)
+        self.o_proj = ClippedLinear(self.num_heads * self.head_dim, self.hidden_size, device=device, dtype=dtype, ops=ops, clipped=clipped)
 
         self.q_norm = RMSNorm(self.head_dim, eps=config["rms_norm_eps"], device=device, dtype=dtype)
         self.k_norm = RMSNorm(self.head_dim, eps=config["rms_norm_eps"], device=device, dtype=dtype)
@@ -1144,6 +1152,8 @@ class Gemma4_Tokenizer():
                     n_audio_tokens = min(_t, 750)
                     media += "<|audio>" + "<|audio|>" * n_audio_tokens + "<audio|>"
                 llama_text = f"{system}<|turn>user\n{media}{text}<turn|>\n<|turn>model\n"
+                if not thinking and self.prefill_empty_thought:
+                    llama_text += "<|channel>thought\n<channel|>"
 
         text_tokens = super().tokenize_with_weights(llama_text, return_word_ids)
 
@@ -1203,6 +1213,7 @@ class _Gemma4Tokenizer:
 # Tokenizer
 class Gemma4SDTokenizer(Gemma4_Tokenizer, sd1_clip.SDTokenizer):
     embedding_size = 2560
+    prefill_empty_thought = False
     def __init__(self, embedding_directory=None, tokenizer_data={}):
         tokenizer_json = tokenizer_data.get("tokenizer_json", None)
         self.tokenizer_json_data = tokenizer_json
@@ -1284,8 +1295,9 @@ def _make_variant(config_cls):
             if audio:
                 self._init_audio(self.model.config, dtype, device, operations)
     embedding_size = config_cls.hidden_size
-    if embedding_size != Gemma4SDTokenizer.embedding_size:
-        tok_cls = type('T', (Gemma4SDTokenizer,), {'embedding_size': embedding_size})
+    prefill = config_cls.prefill_empty_thought
+    if embedding_size != Gemma4SDTokenizer.embedding_size or prefill != Gemma4SDTokenizer.prefill_empty_thought:
+        tok_cls = type('T', (Gemma4SDTokenizer,), {'embedding_size': embedding_size, 'prefill_empty_thought': prefill})
         class Tokenizer(Gemma4Tokenizer):
             tokenizer_class = tok_cls
         Variant.tokenizer = Tokenizer
