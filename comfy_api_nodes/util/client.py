@@ -22,7 +22,7 @@ from server import PromptServer
 from . import request_logger
 from ._helpers import (
     default_base_url,
-    get_auth_header,
+    get_comfy_api_headers,
     get_node_id,
     is_processing_interrupted,
     sleep_with_interrupt,
@@ -84,7 +84,7 @@ class _PollUIState:
 _RETRY_STATUS = {408, 500, 502, 503, 504}  # status 429 is handled separately
 COMPLETED_STATUSES = ["succeeded", "succeed", "success", "completed", "finished", "done", "complete"]
 FAILED_STATUSES = ["cancelled", "canceled", "canceling", "fail", "failed", "error"]
-QUEUED_STATUSES = ["created", "queued", "queueing", "submitted", "initializing", "wait"]
+QUEUED_STATUSES = ["created", "queued", "queueing", "submitted", "initializing", "wait", "in_queue"]
 
 
 async def sync_op(
@@ -148,7 +148,7 @@ async def poll_op(
     queued_statuses: list[str | int] | None = None,
     data: BaseModel | None = None,
     poll_interval: float = 5.0,
-    max_poll_attempts: int = 160,
+    max_poll_attempts: int = 480,
     timeout_per_poll: float = 120.0,
     max_retries_per_poll: int = 10,
     retry_delay_per_poll: float = 1.0,
@@ -254,7 +254,7 @@ async def poll_op_raw(
     queued_statuses: list[str | int] | None = None,
     data: dict[str, Any] | BaseModel | None = None,
     poll_interval: float = 5.0,
-    max_poll_attempts: int = 160,
+    max_poll_attempts: int = 480,
     timeout_per_poll: float = 120.0,
     max_retries_per_poll: int = 10,
     retry_delay_per_poll: float = 1.0,
@@ -486,10 +486,30 @@ async def _diagnose_connectivity() -> dict[str, bool]:
         "api_accessible": False,
     }
     timeout = aiohttp.ClientTimeout(total=5.0)
+
+    # Probe Google and Baidu in parallel: Google is blocked by the GFW in mainland China, so a Baidu probe is required
+    # to correctly detect that Chinese users with working internet do have working internet.
+    internet_probe_urls = ("https://www.google.com", "https://www.baidu.com")
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        with contextlib.suppress(ClientError, OSError):
-            async with session.get("https://www.google.com") as resp:
-                results["internet_accessible"] = resp.status < 500
+        async def _probe(url: str) -> bool:
+            try:
+                async with session.get(url) as resp:
+                    return resp.status < 500
+            except (ClientError, OSError, asyncio.TimeoutError):
+                return False
+
+        probe_tasks = [asyncio.create_task(_probe(u)) for u in internet_probe_urls]
+        try:
+            for fut in asyncio.as_completed(probe_tasks):
+                if await fut:
+                    results["internet_accessible"] = True
+                    break
+        finally:
+            for t in probe_tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*probe_tasks, return_exceptions=True)
         if not results["internet_accessible"]:
             return results
 
@@ -623,7 +643,7 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
 
         payload_headers = {"Accept": "*/*"} if expect_binary else {"Accept": "application/json"}
         if not parsed_url.scheme and not parsed_url.netloc:  # is URL relative?
-            payload_headers.update(get_auth_header(cfg.node_cls))
+            payload_headers.update(get_comfy_api_headers(cfg.node_cls))
         if cfg.endpoint.headers:
             payload_headers.update(cfg.endpoint.headers)
 
