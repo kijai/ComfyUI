@@ -162,7 +162,7 @@ def _apply_rope_downsample_patch():
                     # matching WanAnimatePlus commit 22555324 (Original SCAIL-2 path).
                     pose_tf = {"rope_options": {"shift_y": 0.0, "shift_x": 120.0, "scale_y": 1.0, "scale_x": 1.0},
                                "_scail_rope_downsample": True}
-                    parts.append(_mod.WanModel.rope_encode(self, F_pose, H_pose, W_pose, t_start=0, device=device, dtype=dtype, transformer_options=pose_tf))
+                    parts.append(_mod.WanModel.rope_encode(self, F_pose, H_pose, W_pose, t_start=video_t_start, device=device, dtype=dtype, transformer_options=pose_tf))
                 return torch.cat(parts, dim=1)
 
             # --- Animation mode path (default) ---
