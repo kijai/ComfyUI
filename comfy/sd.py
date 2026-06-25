@@ -72,6 +72,7 @@ import comfy.text_encoders.gemma4
 import comfy.text_encoders.cogvideo
 import comfy.text_encoders.sa3
 import comfy.text_encoders.gpt_oss
+import comfy.text_encoders.diffusion_gemma
 
 import comfy.model_patcher
 import comfy.lora
@@ -451,7 +452,7 @@ class CLIP:
     def get_key_patches(self):
         return self.patcher.get_key_patches()
 
-    def generate(self, tokens, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.95, min_p=0.0, repetition_penalty=1.0, seed=None, presence_penalty=0.0):
+    def generate(self, tokens, **kwargs):
         self.cond_stage_model.reset_clip_options()
 
         self.load_model(tokens)
@@ -460,7 +461,7 @@ class CLIP:
         self.cond_stage_model.set_clip_options({"execution_device": device})
 
         with model_management.cuda_device_context(device):
-            return self.cond_stage_model.generate(tokens, do_sample=do_sample, max_length=max_length, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, repetition_penalty=repetition_penalty, seed=seed, presence_penalty=presence_penalty)
+            return self.cond_stage_model.generate(tokens, **kwargs)
 
     def decode(self, token_ids, skip_special_tokens=True):
         return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
@@ -1353,6 +1354,7 @@ class TEModel(Enum):
     GEMMA_4_31B = 31
     T5_GEMMA = 32
     GPT_OSS_20B = 33
+    DIFFUSION_GEMMA_26B = 34
 
 
 def detect_te_model(sd):
@@ -1379,6 +1381,8 @@ def detect_te_model(sd):
         return TEModel.T5_BASE
     if "model.encoder.layers.0.pre_self_attn_layernorm.weight" in sd:
         return TEModel.T5_GEMMA
+    if "model.decoder.layers.0.router.per_expert_scale" in sd:
+        return TEModel.DIFFUSION_GEMMA_26B
     if 'model.layers.0.post_feedforward_layernorm.weight' in sd:
         if 'model.layers.59.self_attn.q_norm.weight' in sd:
             return TEModel.GEMMA_4_31B
@@ -1586,6 +1590,10 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
         elif te_model == TEModel.GPT_OSS_20B:
             clip_target.clip = comfy.text_encoders.gpt_oss.lens_te(**llama_detect(clip_data))
             clip_target.tokenizer = comfy.text_encoders.gpt_oss.LensTokenizer
+            tokenizer_data["tokenizer_json"] = clip_data[0].get("tokenizer_json", None)
+        elif te_model == TEModel.DIFFUSION_GEMMA_26B:
+            clip_target.clip = comfy.text_encoders.diffusion_gemma.diffusion_gemma_te(**comfy.text_encoders.diffusion_gemma.diffusion_gemma_detect(clip_data))
+            clip_target.tokenizer = comfy.text_encoders.diffusion_gemma.DiffusionGemmaTokenizer
             tokenizer_data["tokenizer_json"] = clip_data[0].get("tokenizer_json", None)
         elif te_model == TEModel.QWEN3_4B:
             if clip_type == CLIPType.FLUX or clip_type == CLIPType.FLUX2:
