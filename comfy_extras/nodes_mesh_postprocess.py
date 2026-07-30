@@ -395,7 +395,7 @@ def _sample_voxel_attrs_per_texel(position_map, mask, voxel_coords, voxel_colors
     float32 in [0,1] (C = feature width: 3 color, 6 PBR). Normalized trilinear over
     occupied voxels (matches official), nearest fallback where all 8 corners empty."""
     H, W, _ = position_map.shape
-    color_np = voxel_colors.detach().cpu().numpy().astype(np.float32)
+    color_np = voxel_colors.detach().float().cpu().numpy().astype(np.float32)
     C = color_np.shape[-1]
     out = np.zeros((H, W, C), dtype=np.float32)
     if not mask.any():

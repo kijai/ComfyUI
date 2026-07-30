@@ -143,7 +143,7 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
     vertices_np = vertices.cpu().numpy().astype(np.float32)
     faces_signed = faces.cpu().numpy().astype(np.int64)
     uvs_np = uvs.cpu().numpy().astype(np.float32) if uvs is not None else None
-    colors_np = vertex_colors.cpu().numpy().astype(np.float32) if vertex_colors is not None else None
+    colors_np = vertex_colors.float().cpu().numpy().astype(np.float32) if vertex_colors is not None else None
     if colors_np is not None:
         colors_np = np.clip(colors_np, 0.0, 1.0)
 
@@ -505,7 +505,7 @@ def mesh_item_to_glb_bytes(mesh, index, metadata=None):
         t = getattr(mesh, attr, None)
         if t is None:
             return None
-        a = (t[index].clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
+        a = (t[index].clamp(0.0, 1.0).float().cpu().numpy() * 255).astype(np.uint8)
         assert a.ndim == 3 and a.shape[-1] == 3, f"{attr} must be (B, H, W, 3), got {tuple(t.shape)}"
         return Image.fromarray(a, mode="RGB")
 
