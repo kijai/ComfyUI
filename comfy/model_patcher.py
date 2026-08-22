@@ -685,12 +685,33 @@ class ModelPatcher:
     def set_model_attn2_output_patch(self, patch):
         self.set_model_patch(patch, "attn2_output_patch")
 
-    def set_model_optimized_attention(self, optimized_attention):
-        def optimized_attention_override(_, *args, **kwargs):
-            return optimized_attention(*args, **kwargs)
+    def set_model_optimized_attention(self, optimized_attention, sigma_start=None, sigma_end=None):
+        if sigma_start is not None and sigma_end is not None:
+            prev_override = self.model_options["transformer_options"].get("optimized_attention_override", None)
+            memo = [None, True]
 
-        if hasattr(optimized_attention, "container_function") and optimized_attention.container_function is not None:
-            optimized_attention_override.container_function = optimized_attention.container_function
+            def optimized_attention_override(func, *args, **kwargs):
+                sigmas = kwargs["transformer_options"].get("sigmas", None)
+                in_range = True
+                if sigmas is not None:
+                    if sigmas is memo[0]:  # memoized per step to avoid a stream sync on every attention call
+                        in_range = memo[1]
+                    else:
+                        sigma = sigmas[0].item()
+                        in_range = sigma_end <= sigma <= sigma_start
+                        memo[0] = sigmas
+                        memo[1] = in_range
+                if in_range:
+                    return optimized_attention(*args, **kwargs)
+                if prev_override is not None:
+                    return prev_override(func, *args, **kwargs)
+                return func(*args, **kwargs)
+        else:
+            def optimized_attention_override(_, *args, **kwargs):
+                return optimized_attention(*args, **kwargs)
+
+            if hasattr(optimized_attention, "container_function") and optimized_attention.container_function is not None:
+                optimized_attention_override.container_function = optimized_attention.container_function
         self.model_options["transformer_options"]["optimized_attention_override"] = optimized_attention_override
 
     def set_model_input_block_patch(self, patch):

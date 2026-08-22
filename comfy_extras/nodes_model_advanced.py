@@ -374,6 +374,9 @@ class ModelAttentionBackend:
             backends.append("comfy kitchen attention")
         return {"required": {"model": ("MODEL",),
                              "attention": (backends,),
+                             },
+                "optional": {"start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Sampling percent at which this backend takes effect. Chain multiple nodes to use different backends for different step ranges."}),
+                             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Sampling percent at which this backend stops being used."}),
                              }}
 
     @classmethod
@@ -385,7 +388,7 @@ class ModelAttentionBackend:
 
     CATEGORY = "model/patch"
 
-    def patch(self, model, attention):
+    def patch(self, model, attention, start_percent=0.0, end_percent=1.0):
         attention_name = {
             "comfy kitchen attention": "comfy_kitchen_int8",
             "pytorch attention": "pytorch",
@@ -395,7 +398,13 @@ class ModelAttentionBackend:
             logging.warning("Attention backend '%s' is unavailable; using PyTorch attention.", attention)
             attention_function = comfy.ldm.modules.attention.get_attention_function("pytorch")
         m = model.clone()
-        m.set_model_optimized_attention(attention_function)
+        if start_percent > 0.0 or end_percent < 1.0:
+            model_sampling = model.get_model_object("model_sampling")
+            m.set_model_optimized_attention(attention_function,
+                                            sigma_start=model_sampling.percent_to_sigma(start_percent),
+                                            sigma_end=model_sampling.percent_to_sigma(end_percent))
+        else:
+            m.set_model_optimized_attention(attention_function)
         return (m, )
 
 
