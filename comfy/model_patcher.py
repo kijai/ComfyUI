@@ -1019,18 +1019,20 @@ class ModelPatcher:
                         m.weight_function = []
                         m.bias_function = []
 
+                    # a patch that resizes the weight is applied now, as the dynamic loader does, so the
+                    # module sees the resized parameter instead of the original shape until the cast
                     if weight_key in self.patches:
-                        if force_patch_weights:
+                        weight, set_func, convert_func = get_key_weight(self.model, weight_key)
+                        if force_patch_weights or comfy.lora.calculate_shape(self.patches[weight_key], weight, weight_key) != weight.shape:
                             self.patch_weight_to_device(weight_key)
                         else:
-                            _, set_func, convert_func = get_key_weight(self.model, weight_key)
                             m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                     if bias_key in self.patches:
-                        if force_patch_weights:
+                        bias, set_func, convert_func = get_key_weight(self.model, bias_key)
+                        if force_patch_weights or comfy.lora.calculate_shape(self.patches[bias_key], bias, bias_key) != bias.shape:
                             self.patch_weight_to_device(bias_key)
                         else:
-                            _, set_func, convert_func = get_key_weight(self.model, bias_key)
                             m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
 
