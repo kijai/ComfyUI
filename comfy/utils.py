@@ -30,7 +30,7 @@ from PIL import Image
 import logging
 import itertools
 from torch.nn.functional import interpolate
-from tqdm.auto import trange
+from tqdm.auto import trange, tqdm
 from einops import rearrange
 from comfy.cli_args import args
 import json
@@ -1304,12 +1304,14 @@ PROGRESS_THROTTLE_MIN_INTERVAL = 0.1  # 100ms minimum between updates
 PROGRESS_THROTTLE_MIN_PERCENT = 0.5   # 0.5% minimum progress change
 
 class ProgressBar:
-    def __init__(self, total, node_id=None):
+    def __init__(self, total, node_id=None, desc=None):
         global PROGRESS_BAR_HOOK
         self.total = total
         self.current = 0
         self.hook = PROGRESS_BAR_HOOK
         self.node_id = node_id
+        self.desc = desc # also show a console tqdm bar, created on the first update
+        self.console = None
         self._last_update_time = 0.0
         self._last_sent_value = -1
 
@@ -1319,6 +1321,13 @@ class ProgressBar:
         if value > self.total:
             value = self.total
         self.current = value
+        if self.desc is not None:
+            if self.console is None:
+                self.console = tqdm(total=self.total, desc=self.desc, disable=not PROGRESS_BAR_ENABLED)
+            self.console.total = self.total
+            self.console.update(value - self.console.n)
+            if value >= self.total:
+                self.console.close()
         if self.hook is not None:
             current_time = time.perf_counter()
             is_first = (self._last_sent_value < 0)

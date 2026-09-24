@@ -488,7 +488,7 @@ class WanVAE(nn.Module):
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         return mu
 
-    def decode(self, z):
+    def decode(self, z, pbar=None):
         # z: [b,c,t,h,w]
         iter_ = 1 + z.shape[2] // 2
         feat_map = None
@@ -508,4 +508,6 @@ class WanVAE(nn.Module):
                     feat_cache=feat_map,
                     feat_idx=conv_idx)
                 out += out_
+            if pbar is not None:
+                pbar.update_absolute(i + 1, iter_)
         return torch.cat(out, 2)

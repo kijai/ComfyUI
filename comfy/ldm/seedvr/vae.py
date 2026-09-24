@@ -1406,7 +1406,7 @@ class VideoAutoencoderKL(nn.Module):
         else:
             return self._encode(x)
 
-    def slicing_decode(self, z: torch.Tensor) -> torch.Tensor:
+    def slicing_decode(self, z: torch.Tensor, pbar=None) -> torch.Tensor:
         if self.use_slicing and (z.shape[2] - 1) > self.slicing_latent_min_size:
             memory_cache = {}
             z_slices = z[:, :, 1:].split(split_size=self.slicing_latent_min_size, dim=2)
@@ -1417,10 +1417,14 @@ class VideoAutoencoderKL(nn.Module):
                     memory_cache=memory_cache,
                 )
             ]
+            if pbar is not None:
+                pbar.update_absolute(1, len(z_slices))
             for z_idx in range(1, len(z_slices)):
                 decoded_slices.append(
                     self._decode(z_slices[z_idx], memory_state=MemoryState.ACTIVE, memory_cache=memory_cache)
                 )
+                if pbar is not None:
+                    pbar.update_absolute(z_idx + 1, len(z_slices))
             out = torch.cat(decoded_slices, dim=2)
             return out
         else:
@@ -1467,7 +1471,7 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
         z, _ = self._encode_with_raw_latent(x)
         return z
 
-    def decode(self, z, seedvr2_tiling=None):
+    def decode(self, z, seedvr2_tiling=None, pbar=None):
         seedvr2_tiling = {} if seedvr2_tiling is None else seedvr2_tiling
         if not isinstance(seedvr2_tiling, dict):
             raise RuntimeError(
@@ -1523,7 +1527,7 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
                 # pipeline can keep batch and time distinct on the tiled path.
                 x = x.unsqueeze(2)
         else:
-            x = super().decode_(latent)
+            x = self.slicing_decode(latent, pbar)
 
         h, w = x.shape[-2:]
         w2 = w - (w % 2)

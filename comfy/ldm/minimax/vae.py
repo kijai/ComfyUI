@@ -704,7 +704,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             num_chunks += 1
         return pad_tokens, num_chunks
 
-    def decode_temporal(self, z, output_buffer=None):
+    def decode_temporal(self, z, output_buffer=None, pbar=None):
         chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
         split_count = int(self.token_drop > 0) + 1
 
@@ -763,6 +763,8 @@ class MiniMaxH3VideoVAE(nn.Module):
                 dec_overlap = None
 
             del clip_dec, clip_z, clip_dec_chunk
+            if pbar is not None:
+                pbar.update_absolute(i + 1, num_chunks)
 
         return dec
 
@@ -793,7 +795,7 @@ class MiniMaxH3VideoVAE(nn.Module):
     def decode_tiled(self, z, **kwargs):
         return self.decode(z)
 
-    def decode(self, z, output_buffer=None):
+    def decode(self, z, output_buffer=None, pbar=None):
         # z: [B, 24, T_lat, H_lat, W_lat] normalized latents -> float32 pixels [B, 3, T, H, W] in [0, 1]
         latents_mean = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
         latents_std = self.latents_std.view(1, -1, 1, 1, 1).to(z)
@@ -805,4 +807,4 @@ class MiniMaxH3VideoVAE(nn.Module):
                 return dec
             output_buffer.copy_(dec)
             return output_buffer
-        return self.decode_temporal(z, output_buffer)
+        return self.decode_temporal(z, output_buffer, pbar)

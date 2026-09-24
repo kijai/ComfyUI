@@ -738,7 +738,7 @@ class WanVAE(nn.Module):
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         return mu
 
-    def decode(self, z):
+    def decode(self, z, pbar=None):
         if z.ndim == 4:
             out = self.decoder(self.conv2(z.unsqueeze(2)), first_chunk=True)
             return unpatchify(out, patch_size=self.patch_size).squeeze(2)
@@ -762,6 +762,8 @@ class WanVAE(nn.Module):
                     feat_idx=conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
+            if pbar is not None:
+                pbar.update_absolute(i + 1, iter_)
         out = unpatchify(out, patch_size=self.patch_size)
         return out
 
