@@ -163,6 +163,16 @@ class LastLayer(nn.Module):
         return comfy.quant_ops.ck.adaln(x, scale, torch.zeros_like(scale[:1]), self.norm.eps)
 
 
+def pdd_head(head, x, n, sigma, sample_sigmas):
+    # PDD head bank: block 0 is the first step's head, later blocks are offsets from it; step i uses head i
+    if sample_sigmas is None:
+        raise ValueError("Qwen Image 2.1 PDD heads need the sampler's sigma schedule")
+    i = min(int((sample_sigmas - sigma).abs().argmin()), n - 1)
+    with comfy.ops.CastBiasWeightContext(head, x, offloadable=True) as (weight, bias):
+        rows = weight.reshape(n, -1, weight.shape[1])
+        return F.linear(x, rows[0] if i == 0 else rows[0] + rows[i], bias)
+
+
 def block_causal_attention(segments, transformer_options={}, cache=None, block_index=0, prefix_len=0):
     # segments: (start, end, mask); text segments get a causal mask, image blocks attend to everything before their end
     def attn(q, k, v, heads, preferred_attention=None):
@@ -368,5 +378,9 @@ class QwenImage21Transformer2DModel(nn.Module):
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, x.device, None, malloc_scope="block")
         comfy.model_prefetch.malloc_graph_end()
         hidden_states = self.norm_out(hidden_states[:, prefix_len:], temb[:-1])
-        hidden_states = self.proj_out(hidden_states)
+        n = self.proj_out.weight.shape[0] // self.out_channels
+        if n > 1:
+            hidden_states = pdd_head(self.proj_out, hidden_states, n, timesteps[0], transformer_options.get("sample_sigmas"))
+        else:
+            hidden_states = self.proj_out(hidden_states)
         return hidden_states.transpose(1, 2).reshape(B, self.out_channels, H, W)
