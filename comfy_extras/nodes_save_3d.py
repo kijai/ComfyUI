@@ -110,7 +110,7 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
              uvs=None, vertex_colors=None, texture_image=None,
              metallic_roughness_image=None, unlit=False,
              normals=None, normal_map_image=None, tangents=None, occlusion_in_mr=False,
-             material=None, emissive_image=None):
+             material=None, emissive_image=None, skin=None):
     """
     Save PyTorch tensor vertices and faces as a GLB file without external dependencies.
 
@@ -137,6 +137,8 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
         metallic/roughness_factor with <0 = auto, emissive_factor/strength, normal_scale,
         occlusion_strength, double_sided).
     emissive_image: PIL.Image - Optional emissive (glow) texture, written as emissiveTexture.
+    skin: dict - Optional rig in the mesh frame: "joints" (J, 3) rest positions, "parents" (J,) with
+        -1 for roots, "indices" (N, 4) joint ids and "weights" (N, 4) normalized skinning weights.
     """
 
     # Convert tensors to numpy arrays
@@ -208,6 +210,14 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
     mr_buffer = mr_png_bytes if mr_png_bytes is not None else b""
     nm_buffer = nm_png_bytes if nm_png_bytes is not None else b""
     em_buffer = em_png_bytes if em_png_bytes is not None else b""
+    joints_buffer = weights_buffer = ibm_buffer = b""
+    if skin is not None:
+        skin_joints = np.asarray(skin["joints"], dtype=np.float32)
+        joints_buffer = np.asarray(skin["indices"], dtype=np.uint16).tobytes()
+        weights_buffer = np.asarray(skin["weights"], dtype=np.float32).tobytes()
+        ibm = np.tile(np.eye(4, dtype=np.float32), (len(skin_joints), 1, 1))
+        ibm[:, :3, 3] = -skin_joints
+        ibm_buffer = np.ascontiguousarray(ibm.transpose(0, 2, 1)).tobytes()  # glTF matrices are column-major
 
     def pad_to_4_bytes(buffer):
         padding_length = (4 - (len(buffer) % 4)) % 4
@@ -218,6 +228,7 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
         ("vertices", vertices_buffer), ("indices", indices_buffer), ("uvs", uvs_buffer),
         ("colors", colors_buffer), ("normals", normals_buffer), ("tangents", tangents_buffer),
         ("texture", texture_buffer), ("mr", mr_buffer), ("nm", nm_buffer), ("em", em_buffer),
+        ("joints", joints_buffer), ("weights", weights_buffer), ("ibm", ibm_buffer),
     ]
     byte_offset = {}
     acc = 0
@@ -344,6 +355,17 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
         })
         primitive_attributes["TANGENT"] = accessor_idx
 
+    if skin is not None:
+        for name, buf, attr, component_type in (("joints", joints_buffer, "JOINTS_0", 5123), ("weights", weights_buffer, "WEIGHTS_0", 5126)):  # UNSIGNED_SHORT, FLOAT
+            buffer_views.append({"buffer": 0, "byteOffset": byte_offset[name], "byteLength": len(buf), "target": 34962})
+            primitive_attributes[attr] = len(accessors)
+            accessors.append({"bufferView": len(buffer_views) - 1, "byteOffset": 0, "componentType": component_type,
+                              "count": n_verts, "type": "VEC4"})
+        buffer_views.append({"buffer": 0, "byteOffset": byte_offset["ibm"], "byteLength": len(ibm_buffer)})
+        ibm_accessor = len(accessors)
+        accessors.append({"bufferView": len(buffer_views) - 1, "byteOffset": 0, "componentType": 5126,
+                          "count": len(skin_joints), "type": "MAT4"})
+
     primitive = {
         "attributes": primitive_attributes,
         "indices": 1,
@@ -453,6 +475,19 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
         "scenes": [{"nodes": [0]}],
         "scene": 0,
     }
+    if skin is not None:
+        # joint j is node j + 1, translated from its parent with identity rotation (rest pose = bind pose)
+        parents = skin["parents"]
+        joint_nodes = [{"name": f"bone_{j}", "translation": (skin_joints[j] - skin_joints[p] if p >= 0 else skin_joints[j]).tolist()}
+                       for j, p in enumerate(parents)]
+        for j, p in enumerate(parents):
+            if p >= 0:
+                joint_nodes[p].setdefault("children", []).append(j + 1)
+            else:
+                gltf["scenes"][0]["nodes"].append(j + 1)
+        gltf["nodes"][0]["skin"] = 0
+        gltf["nodes"] += joint_nodes
+        gltf["skins"] = [{"inverseBindMatrices": ibm_accessor, "joints": list(range(1, len(joint_nodes) + 1))}]
     if images:
         gltf["images"] = images
     if samplers:
@@ -493,7 +528,7 @@ def save_glb(vertices, faces, filepath=None, metadata=None,
     return filepath
 
 
-def mesh_item_to_glb_bytes(mesh, index, metadata=None):
+def mesh_item_to_glb_bytes(mesh, index, metadata=None, skin=None):
     """Serialize one batch item of a MESH to in-memory GLB bytes, carrying every PBR attribute
     (uvs, colors, normals, texture, ORM/occlusion, normal map + tangents, emissive, material).
     Returns None for an empty item. Shared by SaveGLB (per item) and MeshToFile3D."""
@@ -524,6 +559,7 @@ def mesh_item_to_glb_bytes(mesh, index, metadata=None):
         occlusion_in_mr=mesh.occlusion_in_mr,
         material=mesh.material,
         emissive_image=_img("emissive"),
+        skin=skin,
     )
 
 

@@ -2551,6 +2551,7 @@ async def init_builtin_extra_nodes():
         "nodes_loop.py",
         "nodes_sam3d_body.py",
         "nodes_marigold.py",
+        "nodes_skintokens.py",
     ]
 
     import_failed = []

@@ -221,6 +221,8 @@ class Qwen3_06BConfig:
     rope_scale = None
     final_norm: bool = True
     lm_head: bool = False
+    merged_qkv: bool = False
+    merged_mlp: bool = False
     stop_tokens = [151643, 151645]
 
 @dataclass

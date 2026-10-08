@@ -34,6 +34,7 @@ from comfy_extras.sam3d_body.export.openpose_2d import render_pose_data_openpose
 from comfy_extras.sam3d_body.export.bvh import build_bvh
 from comfy_extras.sam3d_body.export.glb_openpose import build_glb_openpose
 from comfy_extras.sam3d_body.export.glb_skeletal import build_glb_skeletal
+from comfy_extras.sam3d_body.retarget import retarget
 from comfy_extras.sam3d_body import face_expression as fx
 from comfy_extras.sam3d_body.utils import image_to_uint8
 
@@ -1104,6 +1105,30 @@ def camera_translation_input():
     )
 
 
+class SAM3DBody_Retarget(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SAM3DBody_Retarget",
+            display_name="Retarget Body Pose to Rig",
+            description="Animate a humanoid rig, e.g. from Auto Rig Mesh (SkinTokens), with the body and finger motion of one "
+                        "person. Bones follow the person's bone directions, so the rig keeps its own proportions and rest pose. "
+                        "Smooth the pose data first to reduce jitter.",
+            search_aliases=["retarget", "mocap", "motion transfer", "animate rig"],
+            category="3d",
+            inputs=[
+                MHRPoseData.Input("mhr_pose_data"),
+                KimodoPoseData.Input("rig", tooltip="Humanoid rig to animate, e.g. the rig output of Auto Rig Mesh (SkinTokens)."),
+                io.Int.Input("track_index", default=0, min=0, max=255, tooltip="Which person of the pose data to use."),
+            ],
+            outputs=[KimodoPoseData.Output(display_name="pose_data")],
+        )
+
+    @classmethod
+    def execute(cls, mhr_pose_data, rig, track_index) -> io.NodeOutput:
+        return io.NodeOutput(retarget(mhr_pose_data, rig, track_index))
+
+
 class BuildPoseFile(io.ComfyNode):
     """Build an animated GLB from pose data, or save it as a BVH mocap file."""
 
@@ -1470,6 +1495,7 @@ class SAM3DBodyExtension(ComfyExtension):
             SAM3DBody_FaceExpression,
             SAM3DBody_Smooth,
             SAM3DBody_Render,
+            SAM3DBody_Retarget,
             BuildPoseFile,
         ]
 

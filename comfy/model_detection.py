@@ -1162,6 +1162,9 @@ def detect_unet_config(state_dict, key_prefix, metadata=None):
                 dit_config["image_model"] = "SAM31"
             return dit_config
 
+    if '{}point_encoder.input_proj.weight'.format(key_prefix) in state_dict_keys and '{}skin_vae.decoder.proj_out.weight'.format(key_prefix) in state_dict_keys: # SkinTokens
+        return {"rig_model": "skintokens"}
+
     if (
         '{}double_blocks.0.attn.img_attn_qkv.weight'.format(key_prefix) in state_dict_keys
         and '{}double_blocks.0.attn.img_attn_q_norm.weight'.format(key_prefix) in state_dict_keys

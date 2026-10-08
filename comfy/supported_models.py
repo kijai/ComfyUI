@@ -2504,6 +2504,18 @@ class SAM31(SAM3):
     unet_config = {"image_model": "SAM31"}
 
 
+class SkinTokens(supported_models_base.BASE):
+    unet_config = {"rig_model": "skintokens"}
+    unet_extra_config = {}
+    supported_inference_dtypes = [torch.bfloat16, torch.float32]
+
+    def get_model(self, state_dict, prefix="", device=None):
+        return model_base.SkinTokens(self, device=device)
+
+    def clip_target(self, state_dict={}):
+        return None
+
+
 class CogVideoX_T2V(supported_models_base.BASE):
     unet_config = {
         "image_model": "cogvideox",
@@ -2673,6 +2685,7 @@ models = [
     ErnieImage,
     SAM3,
     SAM31,
+    SkinTokens,
     CogVideoX_Inpaint,
     CogVideoX_I2V,
     CogVideoX_T2V,

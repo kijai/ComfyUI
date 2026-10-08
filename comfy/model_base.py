@@ -82,6 +82,7 @@ import comfy.ldm.sensenova.conditioning
 import comfy.ldm.sensenova.model
 from comfy.ldm.sensenova.sampling import SenseNovaModelSampling, time_snr_shift
 import comfy.ldm.depth_anything_3.model
+import comfy.ldm.skintokens.model
 
 import comfy.model_management
 import comfy.patcher_extension
@@ -2974,6 +2975,13 @@ class ErnieImage(BaseModel):
 class SAM3(BaseModel):
     def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
         super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.sam3.detector.SAM3Model)
+
+class SkinTokens(BaseModel):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.skintokens.model.SkinTokens)
+
+    def get_dynamic_vram__units(self):
+        return self.diffusion_model.get_dynamic_vram__units()
 
 class CogVideoX(BaseModel):
     def __init__(self, model_config, model_type=ModelType.V_PREDICTION_DDPM, image_to_video=False, device=None):
