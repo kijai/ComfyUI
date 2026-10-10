@@ -9,6 +9,7 @@ import comfy.model_management
 from server import PromptServer
 from comfy_extras.mesh3d.postprocess.qem_decimate import QEMConfig, qem_simplify, qem_cluster_decimate, _compute_vertex_normals, _connected_labels
 from comfy_extras.mesh3d.postprocess.remesh import remesh_narrow_band_dc, _point_tri_closest
+from comfy_extras.mesh3d.postprocess.quad_remesh import quad_remesh
 from comfy_extras.nodes_save_3d import get_mesh_batch_item, pack_variable_mesh_batch
 from comfy_extras.mesh3d.uv_unwrap import mesh as _uv_mesh
 from comfy_extras.mesh3d.uv_unwrap import segment as _uv_seg
@@ -2488,6 +2489,65 @@ class RemeshMesh(IO.ComfyNode):
         return result
 
 
+def _quads_to_triangles(v, q):
+    """Two triangles per quad, split along its shorter diagonal."""
+    d02 = (v[q[:, 0]] - v[q[:, 2]]).norm(dim=1)
+    d13 = (v[q[:, 1]] - v[q[:, 3]]).norm(dim=1)
+    a = torch.stack([q[:, 0], q[:, 1], q[:, 2], q[:, 0], q[:, 2], q[:, 3]], 1)
+    b = torch.stack([q[:, 0], q[:, 1], q[:, 3], q[:, 1], q[:, 2], q[:, 3]], 1)
+    return torch.where((d02 <= d13)[:, None], a, b).view(-1, 3)
+
+
+class QuadRemeshMesh(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="QuadRemeshMesh",
+            display_name="Quad Remesh Mesh",
+            category="3d/mesh",
+            description=(
+                "Field-aligned quad remeshing after QuadWild: a cross field following the curvature, a patch layout "
+                "traced along it and quad patterns fitted to every patch, on the active compute device. Meshes with "
+                "holes, overlapping parts or non-manifold edges are first remeshed into a closed surface (as Remesh "
+                "Mesh, solid, at 512), and very dense ones decimated for the layout. Each quad is output as two "
+                "triangles."
+            ),
+            inputs=[
+                IO.Mesh.Input("mesh"),
+                IO.Int.Input("target_quads", default=10000, min=100, max=1000000, step=100,
+                             tooltip="Approximate number of quads. Small or detailed parts keep a minimum of quads."),
+                IO.Float.Input("alpha", default=0.05, min=0.0, max=1.0, step=0.01, advanced=True,
+                               tooltip="How strongly the quad counts follow the target size against keeping patches "
+                                       "regular: higher matches the size better, lower gives fewer irregular vertices."),
+                IO.Float.Input("adaptive_size", default=0.5, min=0.0, max=1.0, step=0.05, advanced=True,
+                               tooltip="Smaller quads where an even-sized first pass misses detail and larger ones "
+                                       "where it fits, at the same total count. 0 keeps all quads about the same size "
+                                       "and skips the second pass."),
+            ],
+            outputs=[IO.Mesh.Output("mesh")],
+            hidden=[IO.Hidden.unique_id],
+        )
+
+    @classmethod
+    def execute(cls, mesh, target_quads, alpha, adaptive_size):
+        compute_device = comfy.model_management.get_torch_device()
+        _prepare_gpu_mesh_processing(compute_device, 2 ** 31 + _mesh_face_count(mesh) * 8192)
+        counts = {"in": 0, "out": 0}
+
+        def _fn(v, f, c):
+            counts["in"] += int(f.shape[0])
+            qv, qf = quad_remesh(v.to(compute_device).double(), f.to(compute_device).long(), int(target_quads), float(alpha),
+                                 float(adaptive_size))
+            counts["out"] += int(qf.shape[0])
+            tri = _quads_to_triangles(qv, qf)
+            return qv.to(device=v.device, dtype=v.dtype), tri.to(device=v.device, dtype=torch.int32), None
+
+        result = _process_mesh_batch(mesh, _fn)
+        if cls.hidden.unique_id:
+            PromptServer.instance.send_progress_text(f"quads: {_fmt_count(counts['out'])}", cls.hidden.unique_id)
+        return result
+
+
 def _pack_uv_meshes(vs, fs, uvs, colors):
     """Pack per-item (verts, faces, uvs[, colors]) into a MESH; stack if single, else pad."""
     if len(vs) == 1:
@@ -3150,6 +3210,7 @@ class PostProcessMeshExtension(ComfyExtension):
             WeldVertices,
             DecimateMesh,
             RemeshMesh,
+            QuadRemeshMesh,
             UnwrapMesh,
             RenderUVAtlas,
             PaintMesh,
