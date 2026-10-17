@@ -1,6 +1,4 @@
-"""Quad remeshing after QuadWild (Pietroni et al. 2021, "Reliable Feature-Line Driven Quad-Remeshing") with its Bi-MDF
-quantization (Heistermann et al. 2023): a curvature-aligned cross field, a patch layout traced along it, integer
-subdivisions of the patch sides, quad patterns filling every patch, and a final smoothing."""
+"""Quad remeshing after QuadWild (Pietroni et al. 2021) with its Bi-MDF quantization (Heistermann et al. 2023)."""
 from __future__ import annotations
 
 import math
@@ -24,22 +22,21 @@ from .tracer import TRACE_STEPS, trace_patches
 _QUADS_PER_EDGE_AREA = 3.5
 # fewest quads the patterns of a 3/4/5/6-sided patch take
 _MIN_QUADS = {3: 3, 4: 1, 5: 5, 6: 6}
-# faces of the mesh the layout is traced on: at least this many, and this many per target quad
+# decimation target of the tracing mesh: max(_WORK_FACES, _WORK_FACES_PER_QUAD * target_quads) faces
 _WORK_FACES, _WORK_FACES_PER_QUAD = 170_000, 8
 # Remesh Mesh (solid) resolution for inputs that are not closed manifold surfaces
 _SOLID_RESOLUTION = 256
 
 
 def _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick):
-    """Quads of the traced layout for the relative quad size per vertex: integer subdivisions with the count fitted to
-    target_quads, the patterns, and the fit to the input surface."""
+    """Quads of the traced layout for the relative quad size per vertex, with the count fitted to target_quads."""
     dev = verts.device
     area = 0.5 * np.linalg.norm(np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]]), axis=1)
     edge = math.sqrt(_QUADS_PER_EDGE_AREA * (area / size[F].mean(1) ** 2).sum() / target_quads)
     charts, subsides = compute_chart_data(P, F, label, corners, size)
     s = quantize(charts, subsides, edge, alpha=alpha, device=dev)
     tick()
-    # the quad count goes as a / edge^2 above the floor b every patch needs: fit a from the last count, solve again
+    # count ~ a / edge^2 + floor, where floor is the patterns' minimum: fit a to the last count and solve again
     floor = sum(_MIN_QUADS.get(len(c.sides), 0) for c in charts if len(c.faces))
     for _ in range(2):
         pats = [pattern(tuple(int(sum(s[k] for k in side.subsides)) for side in c.sides)) for c in charts if len(c.faces)]
@@ -52,15 +49,15 @@ def _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick):
     tick()
     qv, qf = quadrangulate(P, F, charts, subsides, s, device=dev)
     tick()
-    # the final fit goes to the input surface, not the tracer's smoothed copy of it, which has already lost its tips
+    # fit to the input surface, not the tracer's smoothed copy, which has already lost its tips
     qv = smooth(qv, qf, verts, faces)
     tick()
     return qv, qf
 
 
 def _error_size(P, F, qv, qf, target_quads, adaptive):
-    """Relative quad size per vertex for a second pass: (distance of the surface to the first pass's quads, averaged over
-    about a quad, over its median) ** (-0.7 adaptive), kept within 0.5 ** (2 adaptive) .. 1.5 ** (2 adaptive)."""
+    """Second-pass quad size per vertex, (e / median(e)) ** (-0.7 adaptive) clipped to [0.5, 1.5] ** (2 adaptive), where
+    e is the surface's distance to the first pass's quads averaged over about a quad."""
     quads = qv.float()[qf][:, [0, 1, 2, 0, 2, 3]].reshape(-1, 3, 3)
     err = ck.closest_point_on_mesh(ck.mesh_bvh(quads), torch.as_tensor(P, dtype=torch.float32, device=qv.device))[0].double().cpu().numpy()
     area = 0.5 * np.linalg.norm(np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]]), axis=1).sum()
@@ -73,9 +70,8 @@ def _error_size(P, F, qv, qf, target_quads, adaptive):
 
 
 def _working_mesh(verts, faces, target_quads):
-    """The surface the quads are fitted to and the mesh the layout is traced on: inputs with open or non-manifold edges
-    are first remeshed as Remesh Mesh (solid) does, a surface far denser than the layout needs is decimated for tracing,
-    and sheets touching at a vertex are split apart."""
+    """Surface to fit the quads to and mesh to trace on. Inputs with open or non-manifold edges are remeshed as Remesh
+    Mesh (solid); for tracing, a surface over twice the needed faces is decimated and touching sheets split apart."""
     if bool((opposite_halfedges(faces) < 0).any()):
         v, f, _ = remesh_narrow_band_dc(verts.float(), faces, resolution=_SOLID_RESOLUTION, sign_mode="solid", qef=False,
                                         drop_inverted_components=False, drop_enclosed_components=False)
@@ -92,10 +88,7 @@ def _working_mesh(verts, faces, target_quads):
 
 def quad_remesh(verts: torch.Tensor, faces: torch.Tensor, target_quads: int, alpha: float = 0.05,
                 adaptive_size: float = 0.5):
-    """Quad mesh (vertices (V, 3) float64, quads (Q, 4)) of a triangle mesh (see _working_mesh), on its device;
-    adaptive_size (0..1) re-quantizes the layout with smaller quads where a first pass at even size misses the surface
-    and larger ones where it fits."""
-    # progress: the field, the tracer's steps, then quantization, the count fit, quadrangulation and the fit per pass
+    """Quad mesh ((V, 3) float64, (Q, 4)) on the input device; adaptive_size (0..1) adds an error-sized second pass."""
     steps = 1 + TRACE_STEPS + (8 if adaptive_size > 0 else 4)
     pbar, tq = comfy.utils.ProgressBar(steps), tqdm(total=steps, desc="Quad remesh", leave=False)
 

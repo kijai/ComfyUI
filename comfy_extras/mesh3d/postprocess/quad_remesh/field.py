@@ -1,8 +1,6 @@
-"""Curvature-aligned 4-RoSy cross field, a PyTorch port of QuadWild's organic field setup (libigl principal_curvature with a
-3-ring quadric fit, anisotropy-weighted soft constraints, libigl/CoMISo mixed-integer N-RoSy smoothing). CoMISo rounds the
-integer period jumps greedily in tiny batches; here all jumps under a rising residue threshold are rounded together and the
-angles re-solved with conjugate gradients. Then opposite singularity pairs closer than about a quad are cancelled: below
-the quad size they only cost patches and irregular vertices."""
+"""Curvature-aligned 4-RoSy cross field, a PyTorch port of QuadWild's organic field setup (libigl/CoMISo MIQ smoothing).
+Period jumps under a rising threshold are rounded together instead of CoMISo's tiny greedy batches. Opposite singularity
+pairs closer than about a quad are then cancelled, as they only cost patches and irregular vertices."""
 from __future__ import annotations
 
 import math
@@ -15,16 +13,15 @@ import torch
 from scipy.sparse.csgraph import dijkstra
 
 HALF_PI = math.pi / 2
-# angle deficit within a vertex's 2-ring above which the vertex is the point of a spike
+# 2-ring angle deficit above which a vertex is the point of a spike
 TIP_DEFICIT = math.radians(150)
-# vertices whose k-rings are expanded and fitted at once (about 2 KB each for 3-rings)
+# vertices per k-ring chunk (about 2 KB each for 3-rings)
 RING_CHUNK = 65536
 
 
 class RowSum:
-    """Sums of values (along the first dimension) by row index in a fixed order: sorted by index, each row's values added
-    in sequence. index_add_ on CUDA adds in thread order, so its float sums vary in the last bits from run to run, which
-    the patch layout turns into different quads. Built once per index for repeated sums."""
+    """Deterministic row sums along the first dimension, built once per index. Float index_add_ on CUDA sums in thread
+    order, so its last bits vary between runs, and the patch layout turns that into different quads."""
 
     def __init__(self, index: torch.Tensor, rows: int):
         self.order = torch.argsort(index, stable=True)
@@ -47,8 +44,7 @@ def _normals(verts: torch.Tensor, faces: torch.Tensor) -> Tuple[torch.Tensor, to
 
 
 def _edge_pairs(faces: torch.Tensor):
-    """The two half-edges (3f+k: faces[f,k] -> faces[f,k+1]) of every edge of exactly two faces, in edge key order, and
-    the half-edges' end vertices; an edge of more than two faces counts as a border."""
+    """Half-edge pairs (h0, h1) of edges with two faces, in key order, and the tail and head of each half-edge 3f+k."""
     nv = int(faces.max()) + 1
     a, b = faces.reshape(-1), faces.roll(-1, 1).reshape(-1)
     key = torch.minimum(a, b) * nv + torch.maximum(a, b)
@@ -59,7 +55,7 @@ def _edge_pairs(faces: torch.Tensor):
 
 
 def opposite_halfedges(faces: torch.Tensor) -> torch.Tensor:
-    """For half-edge 3f+k the opposite half-edge index, -1 on borders."""
+    """Opposite of every half-edge 3f+k, -1 on borders."""
     h0, h1, _, _ = _edge_pairs(faces)
     opp = torch.full((faces.numel(),), -1, dtype=torch.long, device=faces.device)
     opp[h0], opp[h1] = h1, h0
@@ -67,7 +63,7 @@ def opposite_halfedges(faces: torch.Tensor) -> torch.Tensor:
 
 
 def _angle_defects(verts: torch.Tensor, faces: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Angle deficit (2 pi minus the corner angles around it) per vertex, 0 on the border vertices, and the border mask."""
+    """Per-vertex angle deficit (2 pi minus the corner angles, 0 on the border) and the border mask."""
     c = verts[faces]
     u, w = c.roll(-1, 1) - c, c.roll(-2, 1) - c
     angles = row_sum(faces.T.reshape(-1), torch.atan2(torch.linalg.cross(u, w).norm(dim=2), (u * w).sum(2)).T.reshape(-1), len(verts))
@@ -77,8 +73,7 @@ def _angle_defects(verts: torch.Tensor, faces: torch.Tensor) -> Tuple[torch.Tens
 
 
 def _rings(faces: torch.Tensor, nv: int, rings: int):
-    """Sorted keys vertex * nv + member of the k-rings (the vertex itself included) as (lo, hi, keys) per chunk of
-    vertices lo..hi."""
+    """Sorted keys vertex * nv + member of the k-rings (vertex included), yielded as (lo, hi, keys) per vertex chunk."""
     dev = faces.device
     a, b = faces.reshape(-1), faces.roll(-1, 1).reshape(-1)
     ring1 = torch.unique(torch.cat([a * nv + b, b * nv + a, torch.arange(nv, device=dev) * (nv + 1)]))
@@ -96,13 +91,11 @@ def _rings(faces: torch.Tensor, nv: int, rings: int):
 
 
 def principal_curvature(verts: torch.Tensor, faces: torch.Tensor, n: torch.Tensor):
-    """Per-vertex first principal direction and curvatures k1 >= k2 (all zero with fewer than 6 neighbours) from a
-    quadric z = au^2+buv+cv^2+du+ev fitted to the 3-ring in the tangent frame of the vertex normal n. Neighbours whose
-    normals face away are dropped when at least 6 remain."""
+    """Per-vertex first principal direction and curvatures k1 >= k2 of a quadric fitted to the 3-ring, zero with fewer
+    than 6 points. Neighbours whose normals face away are dropped while at least 6 points remain."""
     nv, dev = verts.shape[0], verts.device
     a, b = faces.reshape(-1), faces.roll(-1, 1).reshape(-1)
     first = torch.full((nv,), nv, dtype=torch.long, device=dev).scatter_reduce_(0, torch.cat([a, b]), torch.cat([b, a]), reduce="amin")
-    # frame: x = first edge neighbour projected to the tangent plane, y = n x x
     d = verts[first] - verts
     x = torch.nn.functional.normalize(d - (d * n).sum(1, keepdim=True) * n, dim=1, eps=1e-30)
     y = torch.nn.functional.normalize(torch.linalg.cross(n, x), dim=1, eps=1e-30)
@@ -128,7 +121,7 @@ def principal_curvature(verts: torch.Tensor, faces: torch.Tensor, n: torch.Tenso
     L, M, N = 2 * qa * nz, qb * nz, 2 * qc * nz
     den = E * G - Fm * Fm
     m = torch.stack([torch.stack([L * G - M * Fm, M * E - L * Fm], 1), torch.stack([M * E - L * Fm, N * E - M * Fm], 1)], 1) / den[:, None, None]
-    val, vec = torch.linalg.eigh(m)                     # ascending: negated, index 0 is the larger curvature
+    val, vec = torch.linalg.eigh(m)                     # ascending, so after negation index 0 is k1
     valid = (count >= 6)[:, None]
     k = torch.where(valid, -val, 0.0)
     pd1 = torch.nn.functional.normalize(vec[:, 0, 0, None] * x + vec[:, 1, 0, None] * y, dim=1, eps=1e-30)
@@ -136,8 +129,7 @@ def principal_curvature(verts: torch.Tensor, faces: torch.Tensor, n: torch.Tenso
 
 
 def surface_tips(verts: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
-    """Vertices at the point of a spike: the angle deficit summed over the vertex's 2-ring exceeds TIP_DEFICIT and is
-    the largest within that 2-ring (curvature concentrated at a point; rounded ends spread it out)."""
+    """Spike tips: vertices whose 2-ring angle deficit exceeds TIP_DEFICIT and is the largest in their 2-ring."""
     n = len(verts)
     deficit, _ = _angle_defects(verts, faces)
     pair = torch.cat([ring for _, _, ring in _rings(faces, n, 2)])
@@ -148,16 +140,14 @@ def surface_tips(verts: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
 
 
 def _angle_system(fi, fj, target, soft, smooth):
-    """solve(theta, mask, c, iters, tol) for (1-a) sum_e (t_i - t_j + c_e)^2 + a/2 sum_f w_f (t_f - s_f)^2 over the
-    rounded edges (a 0/1 mask over all interior edges): conjugate gradients on the device from theta (updated in place),
-    fewer than iters iterations once the residual is below tol. The CSR matrix over the faces has a fixed pattern: the
-    diagonal, then one entry per interior edge of the face, zero while the edge is not rounded."""
+    """solve(theta, mask, c, iters, tol): conjugate gradients on (1-a) sum_e mask_e (t_i - t_j + c_e)^2 + a/2 sum_f
+    w_f (t_f - s_f)^2, updating theta in place. The CSR pattern is fixed, with zeros for edges not yet rounded."""
     nf, ne, dev = len(target), len(fi), fi.device
     face, order = torch.sort(torch.cat([fi, fj]), stable=True)
     count = torch.bincount(face, minlength=nf)
     slot = torch.arange(len(face), device=dev) - (torch.cumsum(count, 0) - count)[face]
     edge = torch.zeros(nf, 3, dtype=torch.long, device=dev)          # interior edges around each face
-    sign = torch.zeros(nf, 3, dtype=target.dtype, device=dev)        # +1 as its face i, -1 as face j, 0 none
+    sign = torch.zeros(nf, 3, dtype=target.dtype, device=dev)        # +1 where the face is fi, -1 where fj, 0 unused
     edge[face, slot] = order % ne
     sign[face, slot] = torch.where(order < ne, 1.0, -1.0).to(target.dtype)
     faces = torch.arange(nf, device=dev)
@@ -176,9 +166,8 @@ def _angle_system(fi, fj, target, soft, smooth):
 
 
 def miq_field(solve, fi: torch.Tensor, fj: torch.Tensor, k: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Integer period jumps (all rounded) and the face angles of the last rounding solve for the energy
-    (1-a) sum_e (t_i - t_j + k_e + pi/2 p_e)^2 + a/2 sum_f w_f (t_f - s_f)^2, from the angles theta. Free jumps follow
-    the angles exactly, so only rounded edges enter the angle system."""
+    """Round all period jumps p from the angles theta and return (theta, p). Free jumps follow the angles exactly, so
+    only rounded edges enter the angle system."""
     fixed = torch.zeros_like(k, dtype=torch.bool)
     p = torch.zeros_like(k)
     for tau in [1e-4] + [0.5 * (i + 1) / 50 for i in range(50)]:
@@ -195,11 +184,9 @@ def miq_field(solve, fi: torch.Tensor, fj: torch.Tensor, k: torch.Tensor, theta:
 
 def cancel_dipoles(verts: torch.Tensor, faces: torch.Tensor, edge: torch.Tensor, k: torch.Tensor, p: torch.Tensor,
                    reach: float) -> torch.Tensor:
-    """Period jumps with the interior +1/4 and -1/4 singularities closer than reach along the mesh edges cancelled in
-    pairs, closest first: the jumps along the shortest edge path between a pair shift by one, which carries the +1/4
-    over to the -1/4 vertex. The index in quarters of a vertex is (angle defect + sum s k_e) / (pi/2) + sum s p_e over its
-    edges, s = +1 where the edge leaves the vertex. The +1/4 singularities within the 2-ring of a spike's point stay: the
-    tip rings traced around the point need them inside."""
+    """Period jumps with interior +1/4 and -1/4 singularities closer than reach cancelled in pairs, closest first, by
+    shifting the jumps along the shortest edge path between them. +1/4 singularities within 2 rings of a spike tip
+    stay, as the tip rings traced around it need them."""
     nv = verts.shape[0]
     deficit, border = _angle_defects(verts, faces)
     a, b = edge[:, 0], edge[:, 1]
@@ -210,12 +197,11 @@ def cancel_dipoles(verts: torch.Tensor, faces: torch.Tensor, edge: torch.Tensor,
     for _ in range(2):
         keep[torch.cat([a[keep[b]], b[keep[a]]])] = True
     plus, minus = (~border & ~keep & (q == 1)).cpu().numpy(), (~border & (q == -1)).cpu().numpy()
-    # the pairing runs on the host (scipy's Dijkstra)
     length = np.linalg.norm((verts[b] - verts[a]).cpu().numpy(), axis=1)
     a, b = edge.T.cpu().numpy()
     jumps = p.cpu().numpy().astype(np.int64)
     graph = sp.csr_matrix((np.concatenate([length, length]), (np.concatenate([a, b]), np.concatenate([b, a]))), shape=(nv, nv))
-    key = np.minimum(a, b) * nv + np.maximum(a, b)                    # ascending: the edges come in key order
+    key = np.minimum(a, b) * nv + np.maximum(a, b)                    # ascending, since the edges come in key order
     while plus.any() and minus.any():
         dist, pred, src = dijkstra(graph, indices=np.nonzero(plus)[0], limit=reach, return_predecessors=True, min_only=True)
         ends = np.nonzero(minus & np.isfinite(dist))[0]
@@ -237,14 +223,12 @@ def cancel_dipoles(verts: torch.Tensor, faces: torch.Tensor, edge: torch.Tensor,
 
 
 def cross_field(verts: torch.Tensor, faces: torch.Tensor, reach: float) -> torch.Tensor:
-    """Per-face unit direction of the cross field (one of its four branches), (F, 3), with opposite singularity pairs
-    closer than reach cancelled."""
+    """Per-face unit cross field direction (F, 3), with opposite singularity pairs closer than reach cancelled."""
     verts = verts.double()
     fn, vn = _normals(verts, faces)
     e1 = torch.nn.functional.normalize(verts[faces[:, 1]] - verts[faces[:, 0]], dim=1, eps=1e-30)
     e2 = torch.linalg.cross(fn, e1)
-    # soft target angle per face (in the e1, e2 frame): the 4-RoSy average of its vertices' first principal directions
-    # turned into the face plane (Rodrigues, vertex normal onto face normal), weighted by the curvature anisotropy
+    # soft target: 4-RoSy mean of the vertices' principal directions in the face plane, weighted by anisotropy
     pd1, k1, k2 = principal_curvature(verts, faces, vn)
     trim = torch.quantile(torch.cat([k1.abs(), k2.abs()]).float(), 0.95).to(k1.dtype).clamp_min(1e-30)
     weight = (((k1 / trim).clamp(-1, 1) - (k2 / trim).clamp(-1, 1)) / 2).clamp_min(1e-5)[faces].mean(1)
@@ -257,11 +241,10 @@ def cross_field(verts: torch.Tensor, faces: torch.Tensor, reach: float) -> torch
     a = torch.atan2((d * e2[:, None]).sum(2), (d * e1[:, None]).sum(2))
     w = torch.polar(torch.ones_like(a), 4 * a)
     target = torch.angle(w[:, 0] + w[:, 1] + w[:, 2]) / 4
-    # interior edges as oriented in face fi, each once, in key order
     h0, h1, tail, head = _edge_pairs(faces)
     fi, fj = h0 // 3, h1 // 3
     edge = torch.stack([tail[h0], head[h0]], 1)
-    # k_ij such that t_i - t_j + k_ij = 0 for a direction parallel transported across the shared edge
+    # k_ij with t_i - t_j + k_ij = 0 for a direction parallel transported across the edge
     d = verts[edge[:, 1]] - verts[edge[:, 0]]
     k = torch.atan2((d * e2[fj]).sum(1), (d * e1[fj]).sum(1)) - torch.atan2((d * e2[fi]).sum(1), (d * e1[fi]).sum(1))
     solve = _angle_system(fi, fj, target, 0.3 * weight, 2 * (1 - 0.3))   # soft constraint weight a = 0.3

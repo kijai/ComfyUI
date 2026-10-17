@@ -2506,23 +2506,20 @@ class QuadRemeshMesh(IO.ComfyNode):
             display_name="Quad Remesh Mesh",
             category="3d/mesh",
             description=(
-                "Field-aligned quad remeshing after QuadWild: a cross field following the curvature, a patch layout "
-                "traced along it and quad patterns fitted to every patch, on the active compute device. Meshes with "
-                "holes, overlapping parts or non-manifold edges are first remeshed into a closed surface (as Remesh "
-                "Mesh, solid, at 512), and very dense ones decimated for the layout. Each quad is output as two "
-                "triangles."
+                "Field-aligned quad remeshing based on QuadWild: quads follow the surface curvature. Meshes with holes "
+                "or non-manifold edges are first remeshed into a closed surface (as Remesh Mesh, solid). Each quad is "
+                "output as two triangles."
             ),
             inputs=[
                 IO.Mesh.Input("mesh"),
                 IO.Int.Input("target_quads", default=10000, min=100, max=1000000, step=100,
                              tooltip="Approximate number of quads. Small or detailed parts keep a minimum of quads."),
                 IO.Float.Input("alpha", default=0.05, min=0.0, max=1.0, step=0.01, advanced=True,
-                               tooltip="How strongly the quad counts follow the target size against keeping patches "
-                                       "regular: higher matches the size better, lower gives fewer irregular vertices."),
+                               tooltip="Higher follows the target quad size more closely, lower gives fewer "
+                                       "irregular vertices."),
                 IO.Float.Input("adaptive_size", default=0.5, min=0.0, max=1.0, step=0.05, advanced=True,
-                               tooltip="Smaller quads where an even-sized first pass misses detail and larger ones "
-                                       "where it fits, at the same total count. 0 keeps all quads about the same size "
-                                       "and skips the second pass."),
+                               tooltip="Smaller quads where detail needs them and larger ones elsewhere, at the same "
+                                       "total count. 0 keeps quads evenly sized."),
             ],
             outputs=[IO.Mesh.Output("mesh")],
             hidden=[IO.Hidden.unique_id],

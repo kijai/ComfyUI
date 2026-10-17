@@ -1,8 +1,5 @@
-"""Quad patterns for N-sided patches (N = 3..6) with given boundary subdivisions, a port of Takayama et al.'s patchgen
-("Pattern-Based Quadrangulation for N-Sided Patches", SGP 2014) as used by QuadRetopology. Each pattern is a small base
-topology plus integer counts (padding p, inner padding q, edge-flow counts x, y, z, w) tied to the side subdivisions by a
-linear system; the counts become quad strips (padding) and edge loops (strip splits). Patterns are tried in the original
-order over all side rotations and flips; the first feasible one is used."""
+"""Quad patterns for N-sided patches (N = 3..6), a port of Takayama et al.'s patchgen (SGP 2014) as used by
+QuadRetopology. Patterns are tried in the original order over all rotations and flips, and the first feasible wins."""
 from __future__ import annotations
 
 import functools
@@ -14,9 +11,9 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from scipy.optimize import Bounds, LinearConstraint, milp
 
-# Pattern table: variables (matrix columns), constraint matrix, rhs offsets (A v = l - c), whether x is held to the middle
-# of its feasible range, extra "a <= b" constraints, objective variables to maximise, interior vertex count, base faces and
-# edge-loop insertions (parameter, vertex whose outgoing boundary halfedge starts the strip).
+# Pattern table: variables v, constraints A v = l - c, mid_x to hold x within one of the middle of its feasible range,
+# extra "a <= b" constraints le, variables obj to maximise, nv interior vertices, base faces, and edge loops ins as
+# (count, vertex whose outgoing boundary halfedge starts the strip).
 _P = {
     (3, 0): dict(v="p0 p1 p2", A=[[0, 1, 1], [1, 0, 1], [1, 1, 0]], c=[2, 1, 1], nv=1, faces=["C0 V0 C1 C2"], ins=[]),
     (3, 1): dict(v="p0 p1 p2 q1 q2 x", A=[[0, 1, 1, 1, 1, 2], [1, 0, 1, 0, 1, 0], [1, 1, 0, 1, 0, 0]], c=[4, 1, 1], mid_x=True,
@@ -84,7 +81,7 @@ _P = {
 
 
 def _solve(a_eq, b_eq, le_rows, le_rhs, obj):
-    """Nonnegative integer v with a_eq v = b_eq and le_rows v <= le_rhs minimising obj, or None (patchgen's lp_solve ILP)."""
+    """Nonnegative integer v minimising obj with a_eq v = b_eq and le_rows v <= le_rhs, or None (patchgen's ILP)."""
     cons = [LinearConstraint(a_eq, b_eq, b_eq)]
     if le_rows:
         cons.append(LinearConstraint(np.array(le_rows), -np.inf, np.array(le_rhs, dtype=float)))
@@ -100,7 +97,6 @@ def _parameters(spec, l_perm):
     le_rows = [eye[lhs] - eye[rhs] for lhs, rhs in spec.get("le", [])]
     le_rhs = [0.0] * len(le_rows)
     if spec.get("mid_x"):
-        # x within one of the middle of its feasible range
         lo = _solve(a, b, [], [], eye["x"])
         hi = _solve(a, b, [], [], -eye["x"]) if lo is not None else None
         if hi is None:
@@ -113,7 +109,7 @@ def _parameters(spec, l_perm):
 
 
 class _QuadPatch:
-    """Minimal quad mesh with corner tags; faces counter-clockwise."""
+    """Minimal quad mesh with corner tags and counter-clockwise faces."""
 
     def __init__(self, n_corners, n_inner, faces):
         self.corner = list(range(n_corners)) + [-1] * n_inner
@@ -146,7 +142,7 @@ class _QuadPatch:
             i = f.index(a)
             crossed.append((a, b))
             strip.append(fi)
-            a, b = f[(i + 3) % 4], f[(i + 2) % 4]     # the neighbour across the opposite edge has it this way round
+            a, b = f[(i + 3) % 4], f[(i + 2) % 4]     # opposite edge, as the next face sees it
         crossed.append((b, a))
         mid = {k: self.new_vertex() for k in dict.fromkeys(tuple(sorted(e)) for e in crossed)}
         for fi in strip:
@@ -176,8 +172,7 @@ class _QuadPatch:
 
 @functools.lru_cache(maxsize=None)
 def pattern(l: Tuple[int, ...]):
-    """Quad patch for side subdivisions l: 2D vertices (V, 2), quads (F, 4), and per side the vertex chain from corner i to
-    corner i+1 (counter-clockwise). None if no pattern fits."""
+    """Quad patch for side subdivisions l (2D vertices, quads, side chains from corner i to i+1), or None."""
     n = len(l)
     if not 3 <= n <= 6 or sum(l) % 2 or sum(l) < 4:
         return None
@@ -215,7 +210,7 @@ def _geometry(patch: _QuadPatch, l):
     for i in range(n):
         side = [v]
         for j in range(l[i]):
-            s = (i + j / l[i]) % 1                                    # the perimeter position i + j / l[i] within side i
+            s = (i + j / l[i]) % 1                                    # fraction along side i
             pos[v] = (1 - s) * corners[i] + s * corners[(i + 1) % n]
             fixed[v] = True
             v = succ[v]

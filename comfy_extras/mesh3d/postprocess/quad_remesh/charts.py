@@ -1,5 +1,4 @@
-"""Patch layout bookkeeping, a port of QuadRetopology's computeChartData: each traced patch (chart) gets its sides (between
-its corners) and subsides (maximal side pieces shared with one neighbouring patch); subsides are the quantization unknowns."""
+"""Patch sides and subsides (side pieces shared with one neighbour, the quantization unknowns), as computeChartData."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -58,8 +57,7 @@ def _chain_config(start: int, nxt: dict) -> dict:
 
 def compute_chart_data(verts: np.ndarray, faces: np.ndarray, face_label: np.ndarray, corners: List[List[int]],
                        size: np.ndarray):
-    """Charts and subsides from per-face patch labels and per-patch corner vertices; lengths are measured in units of
-    the relative quad size per vertex (all ones for even quads)."""
+    """Charts and subsides from per-face patch labels and per-patch corner vertices."""
     opp = opposite_halfedges(torch.as_tensor(faces)).numpy()
     opp_label = np.where(opp >= 0, face_label[np.maximum(opp, 0) // 3], -1)
     a, b = faces.reshape(-1), np.roll(faces, -1, 1).reshape(-1)
@@ -73,7 +71,7 @@ def compute_chart_data(verts: np.ndarray, faces: np.ndarray, face_label: np.ndar
     edge_subside = {}
     for c, chart in enumerate(charts):
         h = (3 * chart.faces[:, None] + np.arange(3)).reshape(-1)
-        h = h[opp_label[h] != c]                                      # its border half-edges
+        h = h[opp_label[h] != c]
         edge_label, nxt = {}, {}
         for u, v, label in zip(a[h].tolist(), b[h].tolist(), opp_label[h].tolist()):
             edge_label[ek(u, v)] = label
