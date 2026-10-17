@@ -1,9 +1,6 @@
-"""Integer subdivision of every subside with QuadWild's Bi-MDF quantization objective (Heistermann et al. 2023, "Min-
-Deviation-Flow in Bi-directed Graphs for T-Mesh Quantization"): the quadratic deviation of each subside from its target
-edge count plus, per patch, the cheapest emergency flow of its Bi-MDF subgraph fitting its side lengths to a pattern (a
-closed form per valence, _regularity). Minimised by local search from an even-perimeter rounding: Bellman-Ford on the GPU
-over turn costs finds negative cycles of +-1 and paths of +-2 subside changes (both keep every perimeter even), and the
-exactly improving, patch-disjoint ones are applied each round."""
+"""Integer subside subdivision minimising QuadWild's Bi-MDF quantization cost (Heistermann et al. 2023) by local search
+from an even-perimeter rounding. Bellman-Ford on the GPU over turn costs finds negative cycles of +-1 and paths of +-2
+subside changes, which keep perimeters even, and the best improving patch-disjoint ones are applied each round."""
 from __future__ import annotations
 
 import heapq
@@ -15,8 +12,8 @@ import torch
 
 
 def _tri(t, w_sob, w_loop):
-    """Patch cost of a triangle of inner edges (sides t (..., 3), even sum): every side must stay below the sum of the other
-    two minus one, via singularity-on-boundary edges (+1 on the other two sides) and side loops (-2) on the longest side."""
+    """Min patch cost of a triangle of inner edges, sides t (..., 3) with even sum. Each side must end up at most the
+    other two minus 2, via singularity-on-boundary edges (+1 on the other two) and side loops (-2 on the longest)."""
     sob = torch.tensor(list(itertools.product((0, 1), repeat=3)), device=t.device)
     tt = t[..., None, :] + sob.sum(1, keepdim=True) - sob
     e = 2 * tt - tt.sum(-1, keepdim=True)
@@ -28,7 +25,7 @@ def _tri(t, w_sob, w_loop):
 
 
 def _regularity(S):
-    """Min emergency cost of a patch with side sums S (m, n) for Bi-MDF regularity weight 1 (QuadRetopology make_bimdf)."""
+    """Min emergency cost of patches with side sums S (m, n), regularity weight 1 (QuadRetopology make_bimdf)."""
     n = S.shape[1]
     if n == 3:
         return _tri(S, 1, 4)
@@ -36,9 +33,9 @@ def _regularity(S):
         return 2 * ((S[:, 0] - S[:, 2]).abs() + (S[:, 1] - S[:, 3]).abs()).double()
     if n == 5:
         return (2 * (S + S.roll(-1, 1)) - S.sum(1, keepdim=True) + 1).clamp_min(0).sum(1).double()
-    # hexagon: two triangles of inner edges, an odd pair of triangle sums needs one neighbour or opposite link
+    # hexagon: two inner triangles (even and odd sides), odd triangle sums need one neighbour or opposite link
     links = torch.tensor([(i, (i + 1) % 6) for i in range(6)] + [(i, i + 3) for i in range(3)], device=S.device)
-    shift = torch.cat([S.new_zeros(1, 6), -torch.nn.functional.one_hot(links, 6).sum(1)])       # no link, then each one
+    shift = torch.cat([S.new_zeros(1, 6), -torch.nn.functional.one_hot(links, 6).sum(1)])
     link_cost = torch.tensor([0.0] + [3.0] * 6 + [6.0] * 3, dtype=torch.float64, device=S.device)
     t = S[:, None] + shift
     odd = S[:, 0::2].sum(1, keepdim=True) % 2 == 1
@@ -90,8 +87,7 @@ def _make_even(charts, subsides, s, quad, target):
 
 
 def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="cpu", start: np.ndarray | None = None) -> np.ndarray:
-    """Even-perimeter integer subdivisions for all subsides (array indexed by subside id); the local search starts
-    from the rounded targets, or from start when given."""
+    """Even-perimeter subdivision of every subside, by subside id, searched from start or else the rounded targets."""
     dev = torch.device(device)
     active = [ci for ci, c in enumerate(charts) if len(c.faces)]
     nside = np.array([len(charts[ci].sides) for ci in active])
@@ -106,9 +102,8 @@ def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="
     occ_side = np.array([j for sub in subsides for j in sub.chart_sides])
     s = _make_even(charts, subsides, np.maximum(1, np.rint(target) if start is None else start).astype(np.int64), quad, target)
 
-    # turn graph: node 4k+2d+(sigma<0) = subside k changed by sigma, entering the patch at its end d, and the boundary hub
-    # 4 * len(subsides); arcs leave through one occurrence of a patch and enter through another of a different subside,
-    # ordered by patch, then by the two occurrences' places in the patch, then by a and b
+    # turn graph: node 4k+2d+(sigma<0) is subside k changed by sigma, entering a patch at end d, plus the boundary hub.
+    # An arc enters a patch through one occurrence and leaves through an occurrence of another subside.
     occs = [[2 * k + d for k in charts[ci].subsides for d in (0, 1) if subsides[k].charts[d] == ci] for ci in active]
     size = np.array([len(o) for o in occs])
     occ = np.concatenate(occs).astype(np.int64)
@@ -123,7 +118,6 @@ def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="
     o = np.repeat(np.nonzero(occ_row < 0)[0], 2)
     ob = np.tile([0, 1], len(o) // 2)
     hubs = np.full_like(o, hub)
-    # arcs within the patches, then the boundary ones into the hub, then those out of it
     tail = np.concatenate([(2 * oi + a).reshape(-1), 2 * o + ob, hubs])
     head = np.concatenate([(2 * (oo ^ 1) + b).reshape(-1), hubs, 2 * (o ^ 1) + ob])
     tab = np.concatenate([(r * 144 + occ_side[oi] * 24 + a * 12 + occ_side[oo] * 2 + b).reshape(-1), np.full(2 * len(o), -1)])
@@ -168,7 +162,6 @@ def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="
         gains = np.array([iso_k[i:j].sum() for i, j in zip(starts.tolist(), (starts + lens).tolist())])
         ok = np.minimum.reduceat(nx, starts) >= 1
         gains[~ok] = np.inf
-        # patch side changes, rows in the order the candidate's subsides first reach them
         o = np.stack([2 * ks, 2 * ks + 1], 1).reshape(-1)
         owner = np.repeat(np.arange(len(cands)), 2 * lens)
         hit = (occ_row[o] >= 0) & ok[owner]
@@ -178,7 +171,7 @@ def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="
         np.add.at(rowS, (inv, occ_side[o]), d)
         by_first = np.argsort(first)
         own, rows = np.divmod(key[by_first], len(active))
-        old = torch.as_tensor(S[rows])                                    # few rows: costs on the host
+        old = torch.as_tensor(S[rows])                                    # few rows, so costs stay on the host
         c = patch_cost(np.concatenate([rows, rows]), torch.cat([old + torch.as_tensor(rowS[by_first]), old]))
         np.add.at(gains, own, (c[:len(rows)] - c[len(rows):]).numpy())
         return gains
@@ -187,9 +180,8 @@ def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="
         return -1 if v == hub else occ_row[v // 2]
 
     def moves_of(nodes, k, par):
-        """Subside changes of a turn-graph walk (closed, or a path), plus those of every simple cycle it contains (turn
-        costs are exact for a walk that enters each patch once, but double count at a patch it revisits), and the arcs
-        of the walk that enter a patch it already went through."""
+        """Subside changes of a turn-graph walk and of each simple cycle in it, plus the walk's arcs that re-enter a
+        patch, where turn costs double count."""
         first = patch_of(nodes[0] ^ 2) if nodes[0] != hub else -1
         seqs, stack, at, seen, arcs = [], [], {first: -1}, {first}, []
         for v in nodes:
@@ -238,7 +230,7 @@ def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="
             cost = torch.where(tab >= 0, t2[tab.clamp_min(0)], 0.0) + torch.where(out >= 0, isok[out.clamp_min(0)], 0.0)
             cost = cost.masked_fill(banned[k], torch.inf)
 
-            # +-2 paths: start by leaving the patch at the other end of a node's subside, end by entering its patch
+            # +-2 paths add a single side change on the patch the first subside leaves and on the one the last enters
             def single_cost(occ):
                 r = occ_row_d[occ]
                 return torch.where(r >= 0, t1[r.clamp_min(0) * 12 + occ_side_d[occ] * 2 + node_b], 0.0)
@@ -246,7 +238,7 @@ def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="
                 dist = torch.zeros(hub + 1, dtype=torch.float64, device=dev)
             else:
                 dist = torch.cat([single_cost(node_occ ^ 1) + isok[2 * (node_occ // 2) + node_b], torch.full((1,), torch.inf, dtype=torch.float64, device=dev)])
-            # Jacobi Bellman-Ford, stopped early once the parent graph has cycles, which are then negative
+            # Jacobi Bellman-Ford stops early once the parent graph has cycles, which are then negative
             parent, on = ck.bellman_ford(indptr_d, tail_d, cost, dist, hub + 1 if k == 1 else 64)
             par = parent.cpu().numpy()
             seen, walks = set(), []

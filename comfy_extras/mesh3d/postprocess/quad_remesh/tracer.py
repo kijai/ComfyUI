@@ -1,8 +1,5 @@
 """QuadWild's patch tracer (xfield_tracer PatchTracer) on a FieldGraph: field-aligned traces are added greedily until
-every patch they cut the surface into is a valid quad-layout patch (a disk with 3-5 corners, Catmull-Clark-able sides
-and a corner count matching its singularity): concave border vertices are joined first, then loops from sampled nodes
-and border-to-border traces, each farthest from what is traced and splitting a patch not yet valid. Disconnected
-components (the sub-patches of a parent tracer) never interact: every round picks per component, searches run batched."""
+every patch is a disk with 3-5 corners, Catmull-Clark-able sides and a corner count matching its singularity."""
 from __future__ import annotations
 
 import math
@@ -23,7 +20,7 @@ OK, NON_DISK, HAS_EMITTER, LOW_CORNERS, HIGH_CORNERS, NOT_CC, NO_MATCH = range(7
 SAMPLE_RATIO, MIN_SAMPLES, MAX_SAMPLES = 0.01, 50, 1000
 MAX_NARROW_CONST = 0.05
 TRACE_STEPS = 7                                                        # progress steps of trace_patches
-TIP_REACH = 4                                                          # average edges around a spike's point searched for tip rings
+TIP_REACH = 4                                                          # tip ring search radius, in average edges
 
 
 @dataclass
@@ -61,22 +58,21 @@ class Tracer:
 
         self._eid = self._tensor(self.eid)
         self.full_traced = np.zeros(self.nf, dtype=bool)                   # sub-tracing found nothing in these faces
-        # xfield_tracer's NodeDist: searches write every node they relax and nothing resets it, so the farthest-trace
-        # choice reads what earlier searches left wherever the distance pass does not reach
+        # never reset, on purpose: like QuadWild's NodeDist, unreached nodes keep values from earlier searches
         self.node_dist = torch.zeros(self.n, dtype=torch.float64, device=self.dev)
         self.active, self.all_receivers = np.ones(self.n, dtype=bool), False
-        self._spoke_y = np.cross(self.vn, self.dirs[:, 0])                  # tangent frame (dirs[:, 0], this) per vertex
+        self._spoke_y = np.cross(self.vn, self.dirs[:, 0])                  # tangent frame (dirs[:, 0], this)
         self.set_paths([])
 
     # ------------------------------------------------------------------ mesh helpers
     def he_of(self, a, b):
-        """Half-edge a -> b (or -1)."""
+        """Half-edge a -> b, or -1 if there is none."""
         key = np.asarray(a, dtype=np.int64) * self.nv + np.asarray(b)
         i = np.searchsorted(self._dkey, key).clip(max=len(self._dkey) - 1)
         return np.where(self._dkey[i] == key, self._dorder[i], -1)
 
     def closest_dir(self, v, d):
-        """GetClosestDirTo: argmax over the 4 vertex directions, ties to the last index."""
+        """Index of the vertex direction closest to d, ties to the last (GetClosestDirTo)."""
         return 3 - np.argmax(np.einsum("nkc,nc->nk", self.dirs[v], d)[:, ::-1], 1)
 
     def dir_at(self, h, v):
@@ -87,8 +83,7 @@ class Tracer:
 
     @staticmethod
     def _links(lens, loop):
-        """Trace, previous and next position (-1 past an open trace's end) of every node of the traces concatenated
-        with these lengths and loop flags."""
+        """Trace index, previous and next position of each node (-1 past an open trace's ends, loops wrap around)."""
         seg = np.repeat(np.arange(len(lens)), lens)
         first = np.cumsum(lens) - lens
         prv, nxt = np.arange(-1, len(seg) - 1), np.arange(1, len(seg) + 1)
@@ -98,12 +93,12 @@ class Tracer:
 
     @staticmethod
     def _ranges(start, count):
-        """Indices start[i] .. start[i] + count[i] - 1 of all the ranges, concatenated."""
+        """Concatenated index ranges start[i] .. start[i] + count[i] - 1."""
         return np.repeat(start - np.cumsum(count) + count, count) + np.arange(count.sum())
 
     # ------------------------------------------------------------------ init
     def border_table(self):
-        """Edge directions and lengths of the mesh border edges (EdgeDirectionTable::AddBorder, InitEdgeL)."""
+        """Set border half-edge field directions and lengths (EdgeDirectionTable::AddBorder, InitEdgeL)."""
         bh = np.nonzero(self.opp < 0)[0]
         a, b = self.tail[bh], self.head[bh]
         u = self.P[b] - self.P[a]
@@ -113,9 +108,8 @@ class Tracer:
         return bh, a, b, u
 
     def border_frames(self):
-        """Per border vertex the inward normals of its border edges (taken into the vertex frame by the minimal rotation
-        between the normals) and the border edges continued past it (GetOrthoFlatDirections), in face order, and the
-        inward normals summed per vertex."""
+        """Per border edge end, sorted by vertex: the vertex, the edge's inward normal rotated into the vertex frame and
+        the border direction continued past it (GetOrthoFlatDirections). Also the inward normals summed per vertex."""
         bh, a, b, u = self.border_table()
         fn = np.cross(self.P[self.F[:, 1]] - self.P[self.F[:, 0]], self.P[self.F[:, 2]] - self.P[self.F[:, 0]])
         fn /= np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-300)
@@ -134,7 +128,7 @@ class Tracer:
         return verts[order], ortho[order], np.stack([-u, u], 1).reshape(-1, 3)[order], osum
 
     def init_types(self):
-        """Border vertex classes (vertex_classifier.h), their emitters/receivers (vertex_emitter.h) and needs."""
+        """Set vertex classes (vertex_classifier.h), emitter and receiver nodes (vertex_emitter.h) and trace needs."""
         bv, ortho, cont, osum = self.border_frames()
         b = self.opp < 0
         cnt = np.zeros((self.nv, 4), dtype=np.int64)
@@ -151,7 +145,7 @@ class Tracer:
         cv = np.nonzero(self.vtype == CONCAVE)[0]
         i = np.searchsorted(bv, cv)
         e0, e1 = self.closest_dir(cv, ortho[i]), self.closest_dir(cv, ortho[i + 1])
-        # opposite inward normals: also along the border continued past the vertex
+        # with opposite inward normals, also emit along the border continued past the vertex
         c = cont[i] + cont[i + 1]
         e2 = np.where(e1 == (e0 + 2) % 4, self.closest_dir(cv, c / np.maximum(np.linalg.norm(c, axis=1, keepdims=True), 1e-300)), e0)
         for e in (e0, e1, e2):
@@ -165,8 +159,7 @@ class Tracer:
         return np.arccos(np.clip(cos, -1, 1))
 
     def sample_loop_emitters(self):
-        """Loop emitters (SampleLoopEmitters): about SAMPLE_RATIO of each component's vertices (50..1000) spread by
-        farthest-point sampling, emitting along PD1 and PD2 at internal vertices."""
+        """Mark PD1 and PD2 loop emitters at internal farthest-point samples of each component (SampleLoopEmitters)."""
         dev = self.dev
         P, comp = self.g.P, self._tensor(self.comp_v)
         size = np.bincount(self.comp_v, minlength=self.ncomp)
@@ -190,8 +183,7 @@ class Tracer:
 
     # ------------------------------------------------------------------ partitions
     def update_partitions(self):
-        """Patches = face components across unselected edges, their corners and validity type (LazyUpdatePartitions):
-        only the patches that new traces (or changed vertex needs) touch are recomputed, under new ids."""
+        """Recompute patches touched by new traces or needs, with their corners and types (LazyUpdatePartitions)."""
         if self._full:
             fi, aff = np.arange(self.nf), []
             self.label, self.part_faces, self.npart = np.zeros(self.nf, dtype=np.int64), {}, 0
@@ -208,16 +200,14 @@ class Tracer:
         self.label[fi] = self.npart + comp
         self.part_faces.update(zip(new.tolist(), [fi[o] for o in np.split(order, np.cumsum(np.bincount(comp, minlength=ncomp))[:-1])]))
         self.npart += ncomp
-        # new patches have the largest ids, so their (sorted) keys go last
+        # new patches have the largest ids, so appending their keys keeps corner_key sorted
         self.corner_key = np.concatenate([self.corner_key[~np.isin(self.corner_key // self.nv, aff)], self._find_corners(fi, hs)])
         self.ncorners = np.bincount(self.corner_key // self.nv, minlength=self.npart)
         self.ptype = np.concatenate([self.ptype, self._patch_types(hs, new, comp, pv, pe)])
 
     def _split(self, fi):
-        """The faces fi (ascending) split into components across their interior half-edges off traces and the border,
-        numbered by smallest face: the count, the component of every face, the faces ordered by component, fi's
-        half-edges on traces or the border (ascending; every patch boundary half-edge is one of them), and the distinct
-        component * nv + vertex and component * ne + edge keys."""
+        """Components of faces fi (ascending) across untraced interior half-edges: count, per-face component, fi's order
+        by component, fi's traced or border half-edges, and component * nv + vertex and component * ne + edge keys."""
         dev = self.dev
         fs = self._tensor(fi)
         hl = (3 * fs[:, None] + torch.arange(3, device=dev)).reshape(-1)
@@ -233,8 +223,7 @@ class Tracer:
         return (len(first),) + tuple(np.split(torch.cat(parts).cpu().numpy(), np.cumsum([len(x) for x in parts])[:-1]))
 
     def canonical(self):
-        """Update the partitions and renumber the live patches in order of their smallest face (UpdatePartitionsFromChoosen's
-        order)."""
+        """Update the partitions and renumber the patches by smallest face, as UpdatePartitionsFromChoosen does."""
         self.update_partitions()
         live = np.array(sorted(self.part_faces, key=lambda p: self.part_faces[p][0]), dtype=np.int64)
         id_map = np.full(self.npart, -1, dtype=np.int64)
@@ -246,9 +235,8 @@ class Tracer:
         self.npart = len(live)
 
     def _find_corners(self, fi, hs):
-        """Corner keys (partition * nv + vertex) of the patches of the faces fi (hs: their half-edges on traces or the
-        border): convex vertices, and vertices where two of the patch border edges leave along orthogonal or equal
-        field directions (concave ones only where the patch angle stays below pi)."""
+        """Sorted corner keys (patch * nv + vertex) of the patches of faces fi: convex vertices, and vertices where two
+        border edges leave along orthogonal or equal field directions (concave ones only at patch angles below pi)."""
         lab, nv = self.label, self.nv
         p = lab[hs // 3]
         _, first = np.unique(p * self.ne + self.eid[hs], return_index=True)
@@ -269,10 +257,7 @@ class Tracer:
         return ck
 
     def _patch_types(self, hs, parts, comp, pv, pe):
-        """PatchInfo + UpdatePartitionType of the patches parts (the contiguous new ids; comp, pv, pe as _split gives
-        them): disk (Euler characteristic 1), traces still needed by its vertices, 3..5 corners, Catmull-Clark-able
-        sides, and corners matching the valence of its single singularity (4 without one, any count when it sits on a
-        corner)."""
+        """Validity type of each new patch in parts (PatchInfo + UpdatePartitionType)."""
         nv, base, m = self.nv, parts[0], len(parts)
         pvp, pvv = pv // nv, pv % nv
         need = np.bincount(pvp, weights=self.needs[pvv], minlength=m)
@@ -291,8 +276,7 @@ class Tracer:
                          [NON_DISK, HAS_EMITTER, LOW_CORNERS, HIGH_CORNERS, NOT_CC, NO_MATCH], OK)
 
     def _boundary_steps(self, hl):
-        """Patch boundary half-edges among hl (ascending) and the next one of each along the boundary, walking against the
-        face winding so the patch lies on the right (vcg Pos::NextNotFaux)."""
+        """Patch boundary half-edges among hl and the next one of each, patch on the right (vcg Pos::NextNotFaux)."""
         lab, opp = self.label, self.opp
         crossing = lambda x: (opp[x] < 0) | (lab[opp[x] // 3] != lab[x // 3])
         h = hl[crossing(hl)]
@@ -307,19 +291,18 @@ class Tracer:
         return h, e
 
     def boundary_next(self):
-        """_boundary_steps over the whole mesh as half-edge tables: boundary mask and next boundary half-edge."""
+        """Boundary mask and next boundary half-edge (-1 off the boundary) for every half-edge."""
         h, e = self._boundary_steps(np.arange(3 * self.nf))
         nxt = np.full(3 * self.nf, -1, dtype=np.int64)
         nxt[h] = e
         return nxt >= 0, nxt
 
     def _is_corner(self, key):
-        """Which patch * nv + vertex keys are corners (corner_key stays sorted: new patches get the largest ids)."""
+        """Mask of the patch * nv + vertex keys that are corners (corner_key is kept sorted)."""
         return np.append(self.corner_key, -1)[np.searchsorted(self.corner_key, key)] == key
 
     def side_lengths(self, parts, hl):
-        """Side lengths (summed EdgeL) of each listed patch's boundary (its half-edges among hl, ascending), split at
-        its corners, starting at the first boundary half-edge (by face) whose walk starts at a corner."""
+        """Yield each listed patch's side lengths (summed EdgeL) between its corners, or [] if it has none."""
         h, e = self._boundary_steps(hl)
         at_corner = self._is_corner(self.label[h // 3] * self.nv + self.head[h])
         part, first = np.unique(self.label[h[at_corner] // 3], return_index=True)
@@ -333,7 +316,7 @@ class Tracer:
                 yield []
                 continue
             L, cur = [], 0.0
-            for _ in range(len(h)):                     # a walk through a non-manifold vertex can cycle without returning
+            for _ in range(len(h)):                     # a non-manifold vertex can trap the walk in a cycle
                 cur += el[i]
                 i = succ[i]
                 if i == i0 or i < 0:
@@ -345,7 +328,7 @@ class Tracer:
 
     # ------------------------------------------------------------------ traces
     def add_traces(self, traces):
-        """AddChoosen for each trace in order: needs, edge directions, field lengths, selection, collision sets."""
+        """Add traces in order (AddChoosen), updating needs, edge tables, selection and collision sets."""
         if not traces:
             return
         self.paths += traces
@@ -364,7 +347,6 @@ class Tracer:
         dsum /= np.maximum(np.linalg.norm(dsum, axis=1, keepdims=True), 1e-300)
         fl = ((self.P[vb] - self.P[va]) * dsum).sum(1)
         fwd = self.he_of(va, vb)
-        # edge direction table: at the tail along the half-edge, at the head pointing back
         for h, x, y in ((fwd, a % 4, (b % 4 + 2) % 4), (self.he_of(vb, va), (b % 4 + 2) % 4, a % 4)):
             m = h >= 0
             self.tdir[h[m]], self.hdir[h[m]], self.elen[h[m]] = x[m], y[m], fl[m]
@@ -374,7 +356,7 @@ class Tracer:
         self._chosen_edge[self.eid[fwd[fwd >= 0]]] = True
         inner = (prv >= 0) & (nxt >= 0)
         self._chosen_tang[nodes[inner] ^ 2] = True                         # the reverse direction at inner nodes
-        # turns: (previous, next) vertex at every inner node off the border, prepended to the vertex's linked list
+        # prepend the (previous, next) vertex of inner nodes off the border to their vertex's turn list
         at = np.nonzero(inner & ~self.border_v[v])[0]
         n0, k = self._nturn, len(at)
         if n0 + k > len(self._turn_link):
@@ -389,8 +371,7 @@ class Tracer:
         self._nturn += k
 
     def _drop_self_intersecting(self, paths, loop):
-        """SelfIntersect of many node paths at once: those using a (vertex, axis) or an undirected mesh edge twice
-        become None."""
+        """Paths with None for those using a (vertex, axis) pair or a mesh edge twice (SelfIntersect)."""
         idx = [i for i, p in enumerate(paths) if p is not None]
         if not idx:
             return list(paths)
@@ -407,9 +388,8 @@ class Tracer:
         return [None if i in dropped else p for i, p in enumerate(paths)]
 
     def collisions(self, nodes, lens, loop):
-        """CollideTraces of many traces (concatenated nodes, their lengths and loop flags) against every chosen trace: a
-        shared mesh edge, running along one through a shared vertex (both ways, except at a path's own ends), or touching
-        one without crossing (its two spokes not interleaved with ours around the vertex, in the tangent plane)."""
+        """Mask of the traces colliding with a chosen trace (CollideTraces): sharing a mesh edge, running along one
+        through a shared vertex, or touching one without crossing it."""
         seg, prv, nxt = self._links(lens, loop)
         out = np.zeros(len(lens), dtype=bool)
         out[seg[(((nxt >= 0) | (prv < 0)) & self._chosen_node[nodes]) | (((prv >= 0) | (nxt < 0)) & self._chosen_node[nodes ^ 2])]] = True
@@ -435,7 +415,7 @@ class Tracer:
         return bool(self.collisions(np.asarray(nodes), np.array([len(nodes)]), loop)[0])
 
     def splits_open_patches(self, nodes, lens, loop):
-        """SplitSomeNonOKPartition of many traces: the trace runs through the inside of a patch that is not valid yet."""
+        """Mask of the traces that run through the inside of a patch not valid yet (SplitSomeNonOKPartition)."""
         seg, _, nxt = self._links(lens, loop)
         a = np.nonzero(nxt >= 0)[0]
         h = self.he_of(nodes[a] // 4, nodes[nxt[a]] // 4)
@@ -446,8 +426,7 @@ class Tracer:
 
     # ------------------------------------------------------------------ tracing configurations
     def configuration(self, frm, to):
-        """GetTracingConfiguration: (can emit, can receive, must disable) node masks. Emitters are labeled with the
-        class of the traces they start, so FLAT and INTERNAL ones are picked by frm."""
+        """Node masks (can emit, can receive, disabled) for tracing from frm to to (GetTracingConfiguration)."""
         vt = np.repeat(self.vtype, 4)
         tangent = (vt == CONVEX) | ((vt == FLAT) & (self.emitter == NONE) & (self.receiver == NONE))
         removed = (vt == FLAT) & np.repeat(self.singular, 4)
@@ -468,8 +447,7 @@ class Tracer:
 
     # ------------------------------------------------------------------ candidates
     def _trace(self, starts, method, recv, loop_reach=None):
-        """Candidate paths from the start nodes after ExpandPath, None where a search fails or the path intersects
-        itself before or after expanding. Loop searches stop expanding beyond loop_reach."""
+        """Expanded candidate paths from the start nodes, None where the search fails or the path self-intersects."""
         act, s = self._tensor(self.active), self._tensor(starts)
         if method == LOOP:
             paths = self.Q.loops(s, act, loop_reach)
@@ -480,9 +458,7 @@ class Tracer:
         return self._expand(self._drop_self_intersecting(paths, method == LOOP), method == LOOP, act)
 
     def _expand(self, paths, loop, active):
-        """ExpandPath: replace every link by the shortest mesh-edge path between its nodes, so 2-ring jumps become
-        chains of real edges. Each link is a search writing node_dist; candidates run in order and each stops at its
-        first link that cannot be expanded, so the last search to reach a node sets its value."""
+        """Expand every link into the shortest mesh-edge path between its nodes (ExpandPath), updating node_dist."""
         live = np.array([i for i, p in enumerate(paths) if p is not None], dtype=np.int64)
         if not len(live):
             return list(paths)
@@ -490,7 +466,7 @@ class Tracer:
         nodes = np.concatenate([paths[i] for i in live])
         seg, _, nxt = self._links(lens, loop)
         a = np.nonzero(nxt >= 0)[0]
-        a, b, seg = nodes[a], nodes[nxt[a]], seg[a]                         # links, path by path
+        a, b, seg = nodes[a], nodes[nxt[a]], seg[a]
         _, first, hop = np.unique(a * self.n + b, return_index=True, return_inverse=True)   # one search per distinct link
         (flat, ptr), (wq, wv, wd) = self.Q.between(self._tensor(a[first]), self._tensor(b[first]), active)
         size = np.diff(ptr)
@@ -512,7 +488,7 @@ class Tracer:
         out = [None] * len(paths)
         for i, piece in zip(live[ok], np.split(body, np.cumsum(np.bincount(owner, minlength=len(lens))[ok])[:-1])):
             out[i] = piece.tolist()
-        # last writer wins
+        # last writer wins, as in QuadWild's shared NodeDist
         when = self._tensor(last)[wq]
         at = torch.full((self.n,), -1, dtype=torch.long, device=self.dev).scatter_reduce_(0, wv, when, "amax")
         win = (when >= 0) & (when == at[wv])
@@ -520,8 +496,7 @@ class Tracer:
         return self._drop_self_intersecting(out, loop)
 
     def join(self, frm, to, method):
-        """JoinConnection: trace every allowed emitter of the configuration and choose among the traces, from concave
-        vertices shortest first (while an end still needs a trace), the others by distance."""
+        """Trace from all allowed emitters and add the chosen traces (JoinConnection). Returns whether any was added."""
         emit, recv, off = self.configuration(frm, to)
         self.active = ~off
         starts = np.nonzero(emit)[0]
@@ -540,9 +515,8 @@ class Tracer:
         return len(self.paths) > n0
 
     def trace_tip_rings(self):
-        """Two short loops winding once around the point of every spike (surface_tips), traced from the vertices within
-        TIP_REACH average edges of it and kept through removal. Left to the sampled emitters, the loops near a point
-        often only pass by it, which leaves sliver strips or a cap of large quads on the tip."""
+        """Add two short loops winding once around each spike point (surface_tips), kept through removal. Sampled
+        loops alone often just pass by a point, leaving sliver strips or a cap of large quads on the tip."""
         tips = surface_tips(self.g.P, self.g.F).cpu().numpy()
         tips = tips[np.linalg.norm(self.vn[tips], axis=1) > 0]            # a point on zero-area faces has no normal
         if not len(tips):
@@ -551,7 +525,7 @@ class Tracer:
         reach = TIP_REACH * self.avg_edge
         near = [np.nonzero((np.linalg.norm(self.P - self.P[t], axis=1) < reach) & (np.arange(self.nv) != t))[0] for t in tips.tolist()]
         owner = np.repeat(tips, [2 * len(x) for x in near]).tolist()
-        # a ring stays within 2 * reach of the tip, so it is no longer than 4 pi reach (4x for the drift penalty)
+        # a ring within 2 * reach of the tip is at most 4 pi reach long, times 4 for the drift penalty
         paths = self._trace(np.concatenate([np.concatenate([4 * x, 4 * x + 1]) for x in near]), LOOP, None, 16 * np.pi * reach)
         cands = {}
         for t, nodes in zip(owner, paths):
@@ -575,15 +549,12 @@ class Tracer:
                     added += 1
 
     def _choose_by_distance(self, paths, loop):
-        """ChooseGreedyByDistance: per component and round, take the candidate farthest (mean node_dist over its nodes)
-        from everything traced that splits a patch not valid yet, in the previous round's order (farthest first, ties as
-        before), dropping those rejected on the way. A candidate that collides stays colliding and only traces sharing a
-        vertex with it can change that, so collisions are kept per candidate and refreshed where new traces pass."""
+        """Greedily add the farthest candidates (mean node_dist) splitting an invalid patch, one per component per round
+        (ChooseGreedyByDistance). Collisions need a shared vertex: only candidates touching new traces are rechecked."""
         if not paths:
             return
         self.update_partitions()
-        # InitNodeDistances: link-length distance to disabled nodes, chosen traces (both ways along them) and singular
-        # vertices, written over node_dist where it reaches
+        # InitNodeDistances from disabled nodes, chosen traces and singular vertices (unreached nodes keep their value)
         src = ~self.active | np.repeat(self.singular, 4) | self._chosen_node | self._chosen_node[np.arange(self.n) ^ 2]
         fresh = self.Q.distances(self._tensor(np.nonzero(src)[0]), torch.ones(self.n, dtype=torch.bool, device=self.dev))
         self.node_dist = torch.where(torch.isfinite(fresh), fresh, self.node_dist)
@@ -609,7 +580,7 @@ class Tracer:
             pos[order] = np.arange(len(order))
             at, picked = np.nonzero(np.diff(comp[order], prepend=-1))[0], []
             last = np.diff(comp[order], append=-1) != 0
-            while len(at):                                                  # the next candidate of every searching component
+            while len(at):                                                  # next candidate of each searching component
                 c = order[at]
                 ok = self.splits_open_patches(*gather(c))
                 queued[c[~ok]] = False
@@ -619,7 +590,7 @@ class Tracer:
             if not len(picked):
                 break
             queued[picked] = False
-            self.add_traces([Trace(paths[i], loop) for i in picked])     # one per component: no shared vertices
+            self.add_traces([Trace(paths[i], loop) for i in picked])     # one per component, so no shared vertices
             new = gather(picked)[0]
             new_src = np.unique(np.concatenate([new, new ^ 2]))
             self.node_dist = self.Q.distances(self._tensor(new_src[self.active[new_src]]), act, self.node_dist)
@@ -635,7 +606,7 @@ class Tracer:
             pass
 
     def batch_add_loops(self, force_receivers=False, force_always=False):
-        """BatchAddLoops with AddOnlyNeeded: concave joins, loops, then border-to-border traces."""
+        """Add concave joins, loops, then border-to-border traces (BatchAddLoops with AddOnlyNeeded)."""
         if force_receivers:
             self.all_receivers = True
             self.max_weight /= 100
@@ -650,7 +621,7 @@ class Tracer:
 
     # ------------------------------------------------------------------ sub-patches
     def set_paths(self, paths):
-        """SetChoosenFromVertDir: rebuild the chosen traces (and the edge tables derived from them)."""
+        """Replace the chosen traces and rebuild the tables derived from them (SetChoosenFromVertDir)."""
         self.paths, self._full, self._dirty, self._nturn = [], True, [], 0
         # field direction along each half-edge at its tail, and back along it at its head
         self.tdir, self.hdir = np.full(3 * self.nf, -1, dtype=np.int64), np.full(3 * self.nf, -1, dtype=np.int64)
@@ -658,16 +629,14 @@ class Tracer:
         self._sel_t = self._tensor(self.opp < 0)                            # half-edges on the border or a trace
         self._chosen_node, self._chosen_tang = np.zeros(self.n, dtype=bool), np.zeros(self.n, dtype=bool)
         self._chosen_edge = np.zeros(self.ne, dtype=bool)
-        # (previous, next) vertex of the chosen traces at every vertex they pass through, as a linked list per vertex
+        # per-vertex linked lists of turns: (next turn, previous vertex, next vertex) of each chosen trace through it
         self._turn_head = np.full(self.nv, -1, dtype=np.int64)
-        self._turn_link = np.zeros((0, 3), dtype=np.int64)                 # next turn of the vertex, previous, next
+        self._turn_link = np.zeros((0, 3), dtype=np.int64)
         self.border_table()
         self.add_traces(list(paths))
 
     def sub_tracer(self, parts, resample):
-        """Tracer over the disjoint union of the listed patches (TraceSubPatch for all of them at once), inheriting vertex
-        types, needs and the traces inside each patch; patch corners are convex, and patch border vertices emit and
-        receive along their flat emitters (when still active here) and orthogonally to the traces (see below)."""
+        """Sub-tracer over the listed patches (TraceSubPatch for all at once), and how many traces were copied in."""
         rank = np.full(self.npart, -1, dtype=np.int64)
         rank[parts] = np.arange(len(parts))
         fc = rank[self.label]
@@ -689,8 +658,7 @@ class Tracer:
         osum = sub.border_frames()[3]
         norm = np.linalg.norm(osum, axis=1, keepdims=True)
         dots = np.einsum("kdc,kc->kd", sub.dirs, osum / np.maximum(norm, 1e-300))
-        # a node traced along d emits along d + 1 or d + 3, whichever is closer to the inward normal (both without
-        # one), and receives along the other
+        # traced along d: emit along d + 1 or d + 3, whichever is nearer the inward normal, receive along the other
         g = dots > np.roll(dots, 2, 1)
         off, g2 = norm == 0, np.roll(g, 2, 1)
         traced = self._chosen_node.reshape(-1, 4)[vmap]
@@ -701,8 +669,7 @@ class Tracer:
         sub.receiver = np.where(cv, self.receiver.reshape(-1, 4)[vmap], np.where(flat & recv, FLAT, NONE)).reshape(-1)
         sub.emitter = np.where(cv, self.emitter.reshape(-1, 4)[vmap], np.where(flat & emit & ~recv, FLAT, NONE)).reshape(-1)
 
-        # CopyPathsFrom: the pieces of this tracer's traces through the inside of a listed patch (both faces of each edge
-        # in it), as runs of local nodes: a run's first link start, then every link's end
+        # CopyPathsFrom: trace links inside a listed patch, as runs of local nodes (first link's start, then link ends)
         nodes = np.array([n for t in self.paths for n in t.nodes], dtype=np.int64)
         seg, _, nxt = self._links(np.array([len(t.nodes) for t in self.paths], dtype=np.int64), np.array([t.loop for t in self.paths], dtype=bool))
         a = np.nonzero(nxt >= 0)[0]
@@ -721,7 +688,7 @@ class Tracer:
         return sub, len(pieces)
 
     def solve_sub_patches(self, only_non_disk, force_always):
-        """SolveSubPatches: trace every patch that is not valid yet (or not a disk) on its own, until nothing changes."""
+        """Trace each invalid (or each non-disk) patch on its own until nothing changes (SolveSubPatches)."""
         while True:
             self.canonical()
             todo = np.nonzero(self.ptype == NON_DISK if only_non_disk else self.ptype != OK)[0]
@@ -739,10 +706,9 @@ class Tracer:
 
     # ------------------------------------------------------------------ removal
     def fixed_corners(self):
-        """FixAmmittableValences: patches with more than 6 corners lose their widest non-feature corners down to 5.
-        Patches with fewer than 3 get corners by length along their boundary: halving the longer side of a two-cornered
-        patch, else thirds from its corner or first vertex. (QuadWild adds the flattest-angle vertices, which can leave
-        one side longer than the other two together: a triangle no quad pattern fills without stretching its neighbours.)"""
+        """Corner vertices per patch (FixAmmittableValences). Over 6 corners: drop the widest, non-feature ones first,
+        down to 5. Under 3: add corners spaced by boundary length, since QuadWild's flattest vertices can leave one side
+        longer than the other two together, which no quad pattern fills without stretching."""
         out = [c.tolist() for c in np.split(self.corner_key % self.nv, np.cumsum(self.ncorners)[:-1])]
         bnd, nxt = self.boundary_next()
         for p in [p for p, c in enumerate(out) if len(c) < 3 or len(c) > 6]:
@@ -782,7 +748,7 @@ class Tracer:
         return out
 
     def split_into_subpaths(self):
-        """SplitIntoSubPaths: cut every trace at the vertices where traces meet (or that lie on the border), and rebuild."""
+        """Cut every trace at vertices where traces meet or that lie on the border (SplitIntoSubPaths)."""
         q = np.bincount(np.array([n // 4 for t in self.paths for n in t.nodes], dtype=np.int64), minlength=self.nv)
         cut = (q >= 2) | (self.border_v & (q >= 1))
         new = []
@@ -800,8 +766,7 @@ class Tracer:
 
     @staticmethod
     def merge_contiguous(paths):
-        """MergeContiguousPaths: join open traces that continue each other straight (same node, or reversed: node ^ 2),
-        scanning pairs (i, j > i) in order."""
+        """Join open traces that continue each other, also through reversed nodes (MergeContiguousPaths)."""
         paths = [Trace(list(t.nodes), t.loop, t.unremovable) for t in paths]
         while True:
             starts, ends = {}, {}
@@ -814,7 +779,7 @@ class Tracer:
                 js = i + 1
                 while A.nodes and not A.loop:
                     a = A.nodes
-                    # the traces after A are unchanged or emptied, so the first candidate continues A in one of these ways
+                    # traces after A are unchanged or emptied, so the first candidate continues A in one of these ways
                     cand = [j for j in starts.get(a[-1], []) + ends.get(a[0], []) + ends.get(a[-1] ^ 2, []) + starts.get(a[0] ^ 2, [])
                             if j >= js and paths[j].nodes]
                     if not cand:
@@ -839,8 +804,7 @@ class Tracer:
                 return paths
 
     def remove_traces(self):
-        """BatchRemovalMetaMesh with a pre-removal pass: dissolve whole traces, cut them at crossings, dissolve again.
-        Unremovable traces (the tip rings) stay."""
+        """Dissolve unneeded traces, then cut the rest at crossings and dissolve again (BatchRemovalMetaMesh)."""
         for step in range(2):
             if step:
                 self.split_into_subpaths()
@@ -855,9 +819,8 @@ class Tracer:
 
     # ------------------------------------------------------------------ smoothing and output
     def smooth_patches(self, steps):
-        """SmoothMeshPatchesFromEdgeSel: traced vertices slide along their trace, the others are Laplacian smoothed,
-        both reprojected onto the surface as it was at the call; a vertex whose face folds or gets too thin (quality
-        below 0.2) goes back, and remaining folds get a final Laplacian."""
+        """Smooth self.P (SmoothMeshPatchesFromEdgeSel): traced vertices slide along their trace, others get Laplacian
+        smoothing, all reprojected onto the unsmoothed surface. Vertices that fold or thin out a face move back."""
         dev = self.dev
         P = self._tensor(self.P)
         F = self.g.F
@@ -907,8 +870,7 @@ class Tracer:
         self.wedge = self._wedge_angles(self.P)
 
     def patches(self):
-        """The traced layout as (vertices, faces, per-face patch, corners per patch): the preprocessed mesh with its
-        smoothed positions, patches that are not disks dropped (SaveAllData)."""
+        """Layout as (vertices, faces, patch per face, corners per patch), dropping non-disk patches (SaveAllData)."""
         self.canonical()
         corners = self.fixed_corners()
         keep_part = self.ptype != NON_DISK
@@ -917,8 +879,7 @@ class Tracer:
 
 
 def trace_patches(verts, faces, face_dir, progress_callback):
-    """QuadWild's trace(): patch layout of a triangle mesh along its cross field. progress_callback is called after
-    each of its TRACE_STEPS steps."""
+    """Patch layout of a triangle mesh along its cross field (QuadWild's trace()). Calls progress_callback per step."""
     g, pd1f = build_graph(verts, faces, face_dir)
     tr = Tracer(g, pd1f, np.zeros(g.P.shape[0], dtype=np.int64))
     tr.init_types()

@@ -1,8 +1,7 @@
-"""The field-line graph QuadWild traces patch borders on (xfield_tracer PreProcessMesh + VertexFieldGraph), for meshes
-without sharp features: every edge around a singular vertex is split at its midpoint, the face cross field is averaged
-onto the vertices, and node 4v+d (direction d of [PD1, PD2, -PD1, -PD2] at vertex v) links to the nodes of its 1- and
-2-ring neighbours that lie within 90 degrees of d, with the direction label carried across by the minimal rotation
-between the vertex normals. Internal singular vertices get no links, so traces pass around them."""
+"""Field-line graph that QuadWild traces patch borders on (xfield_tracer PreProcessMesh + VertexFieldGraph).
+
+Node 4v+d (direction d of [PD1, PD2, -PD1, -PD2] at vertex v) links to the 1- and 2-ring nodes within 90 degrees of d.
+Edges around singular vertices are split first; internal singular vertices get no links, so traces go around them."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,8 +12,7 @@ import torch
 
 from .field import _normals, opposite_halfedges, row_sum
 
-# RefineE split table (vcg refine.h): child triangles over [V0, V1, V2, mid01, mid12, mid20] per split-edge mask, and the
-# diagonals compared to pick the shorter one when a face splits into three
+# vcg RefineE children over [V0, V1, V2, mid01, mid12, mid20] per split-edge mask; 3-way splits use the shorter diagonal
 _SPLIT = [
     ([(0, 1, 2)], None),
     ([(0, 3, 2), (3, 1, 2)], None),
@@ -26,9 +24,9 @@ _SPLIT = [
     ([(3, 4, 5), (0, 3, 5), (3, 1, 4), (5, 4, 2)], None),
 ]
 DRIFT, MAX_ANGLE = 100.0, 45.0
-# mean links a path expansion search may cover before its hop counts as one that cannot be expanded
+# reach of the first between() search, in mean link lengths; the rows it cuts short are redone uncapped
 HOP_REACH = 32
-# bytes of GPU memory the searches' distance rows and hash tables are sized for
+# GPU bytes the searches' distance rows and hash tables are sized for
 BUDGET = 2 ** 29
 
 
@@ -37,7 +35,7 @@ def _unit(x):
 
 
 def _ranges(start, count):
-    """(range id, index) of every entry of the index ranges start[r] .. start[r] + count[r] - 1."""
+    """Range id and index of every entry of the ranges start[r] .. start[r] + count[r] - 1."""
     rep = torch.repeat_interleave(torch.arange(len(count), device=count.device), count)
     return rep, start[rep] + torch.arange(len(rep), device=count.device) - (torch.cumsum(count, 0) - count)[rep]
 
@@ -45,7 +43,7 @@ def _ranges(start, count):
 def _rotate(v, a, b):
     """Apply the minimal rotation taking unit a to unit b to v (vcg RotationMatrix)."""
     c = (a * b).sum(-1, keepdim=True)
-    # antiparallel normals: 180 degrees about an axis perpendicular to a (only on degenerate folds)
+    # antiparallel a and b (degenerate folds): 180 degrees about an axis perpendicular to a
     perp = torch.where(a[..., :1].abs() < 0.9, a.new_tensor([1.0, 0, 0]), a.new_tensor([0, 1.0, 0]))
     k = torch.where(c < -1 + 1e-9, _unit(torch.linalg.cross(a, perp)), _unit(torch.linalg.cross(a, b)))
     phi = torch.acos(c.clamp(-1, 1))
@@ -66,8 +64,7 @@ def _mismatch(axes, fn, f, g):
 
 
 def singular_index(F, opp, pd1f, fn, nv):
-    """Field index per vertex (IsSingularByCross with border vertices): period jumps summed clockwise around the fan, plus
-    a jump from the last to the first fan face at border vertices. Returns 0 (regular) .. 3."""
+    """Field index 0 (regular) .. 3 per vertex: period jumps around its fan, closed at borders (IsSingularByCross)."""
     axes = _cross_axes(pd1f, fn)
     v = F.reshape(-1)
     f = torch.arange(len(v), device=F.device) // 3
@@ -85,9 +82,7 @@ def singular_index(F, opp, pd1f, fn, nv):
 
 
 def _refine(P, F, split):
-    """Split the marked edges at their midpoints with vcg RefineE's patterns and numbering (new vertices in order of first
-    occurrence over faces and their edges, first child in place of its face, other children appended in face order).
-    Returns the vertices, the faces and the parent face of each."""
+    """Split every edge with a marked end vertex at its midpoint (vcg RefineE); returns vertices, faces and parents."""
     key = np.minimum(F, np.roll(F, -1, 1)) * len(P) + np.maximum(F, np.roll(F, -1, 1))
     marked = split[F] | split[np.roll(F, -1, 1)]
     uniq, first = np.unique(key[marked], return_index=True)
@@ -129,8 +124,7 @@ class FieldGraph:
 
 
 def _vertex_field(F, fn, z, pd1f):
-    """Per-vertex 4-RoSy average of the incident face fields in a fixed frame around the vertex normal z (vcg
-    InterpolateNRosy3D)."""
+    """Vertex cross field (V, 4, 3): 4-RoSy average of the incident face fields (vcg InterpolateNRosy3D)."""
     x = _unit(torch.linalg.cross(z, torch.where(z[:, :1].abs() > 0.999, z.new_tensor([0, 1.0, 0]), z.new_tensor([1.0, 0, 0]))))
     y = _unit(torch.linalg.cross(x, z))
     fv = F.reshape(-1)
@@ -146,8 +140,7 @@ def _vertex_field(F, fn, z, pd1f):
 
 
 def build_graph(P: torch.Tensor, F: torch.Tensor, face_dir: torch.Tensor) -> tuple[FieldGraph, torch.Tensor]:
-    """Preprocessed mesh (edges around singular vertices split) and its field graph from a triangle mesh and its
-    per-face cross-field direction. Also returns the per-face PD1 of the split mesh (sub-patch graphs inherit it)."""
+    """Field graph of the mesh with the edges around singular vertices split, and the split mesh's per-face PD1."""
     pd1f = _unit(face_dir)
     sing = singular_index(F, opposite_halfedges(F), pd1f, _normals(P, F)[0], len(P)) != 0
     newP, newF, parent = _refine(P.cpu().numpy(), F.cpu().numpy(), sing.cpu().numpy())
@@ -158,8 +151,7 @@ def build_graph(P: torch.Tensor, F: torch.Tensor, face_dir: torch.Tensor) -> tup
 
 
 def link_graph(P, F, vn, dirs, pd1f, valence) -> FieldGraph:
-    """Field graph of a mesh whose vertex normals, vertex field and singularity valences are given (a sub-patch keeps
-    its parent's); singular vertices are found on this mesh, so patch borders get their own."""
+    """Field graph of a mesh with given vertex normals, field and valences; singular vertices are found on this mesh."""
     dev, nv = P.device, len(P)
     opp = opposite_halfedges(F)
     singular = singular_index(F, opp, pd1f, _normals(P, F)[0], nv) != 0
@@ -167,8 +159,7 @@ def link_graph(P, F, vn, dirs, pd1f, valence) -> FieldGraph:
     border = torch.zeros(nv, dtype=torch.bool, device=dev)
     border[torch.cat([half_a[opp < 0], half_b[opp < 0]])] = True
 
-    # candidate vertex pairs: 1-ring without border edges and internal singular vertices, plus the 2-ring through and
-    # onto non-border vertices
+    # 1-ring pairs minus border edges and internal singular vertices, plus 2-ring pairs through and onto non-border ones
     internal_sing = singular & ~border
     ok = (opp >= 0) & ~internal_sing[half_a] & ~internal_sing[half_b]
     ring1 = torch.unique(torch.stack([half_a[ok], half_b[ok]], 1), dim=0)          # sorted by (i, k)
@@ -187,12 +178,12 @@ def link_graph(P, F, vn, dirs, pd1f, valence) -> FieldGraph:
     tn = (t * n0).sum(-1, keepdim=True)
     t = torch.where(tn.abs() > 0.1, _unit(t - tn * n0), t)
     cos = ((dirs[i] * t[:, None]).sum(-1) / (dirs[i].norm(dim=-1) * t.norm(dim=-1, keepdim=True))).clamp(-1, 1)
-    ang = torch.rad2deg(torch.acos(cos))                                    # (pairs, 4)
+    ang = torch.rad2deg(torch.acos(cos))
     r = _rotate(dirs[i], vn[i][:, None].expand(-1, 4, -1), vn[k][:, None].expand(-1, 4, -1))
     d1 = 3 - (dirs[k][:, None] * r[:, :, None]).sum(-1).flip(-1).argmax(-1)       # closest direction, ties to the last
     pi, d = torch.nonzero(ang < 90, as_tuple=True)                       # links (pair, direction)
 
-    # drop links into dead ends (nodes without links) until none is left, except into border nodes
+    # repeatedly drop links into nodes without links, except into border nodes
     while True:
         src, dst = 4 * i[pi] + d, 4 * k[pi] + d1[pi, d]
         drop = (torch.bincount(src, minlength=4 * nv) == 0)[dst] & ~border[dst // 4]
@@ -207,10 +198,7 @@ def link_graph(P, F, vn, dirs, pd1f, valence) -> FieldGraph:
 
 
 class Queries:
-    """Batched shortest-path queries on a FieldGraph with xfield_tracer's VertexFieldQuery::ShortestPath results: each
-    query is relaxed frontier by frontier on its own distance row (pruned by the best answer found so far), then the
-    path is read back taking, at every node, the predecessor Dijkstra would have settled it from (smallest distance,
-    then largest node id)."""
+    """Batched shortest-path queries on a FieldGraph, matching xfield_tracer's VertexFieldQuery::ShortestPath."""
 
     def __init__(self, g: FieldGraph):
         self.n = 4 * g.P.shape[0]
@@ -229,22 +217,17 @@ class Queries:
         self.node_border = g.border.repeat_interleave(4)
         self.indptr, self.dst = g.indptr.int(), g.dst.int()
         self.rows = max(1, BUDGET // (self.n * 28))      # distances plus the search's queues, far piles and list
-        mean = float(g.dist.mean()) if len(g.dist) else 1.0     # sub-patches of singular vertices only have no links
-        self.hop_reach = HOP_REACH * mean          # cap of the sparse path expansion searches
+        mean = float(g.dist.mean()) if len(g.dist) else 1.0     # sub-patches of only singular vertices have no links
+        self.hop_reach = HOP_REACH * mean
         self.delta = {"drift": 32 * mean, "length": 8 * mean, "edge": 8 * mean}   # bucket widths
 
     def _search(self, starts, kind, active, end=None, stop=None, reach=None, blocked=None, closer=None):
-        """Delta-stepping from one start node per row, each row pruned by its best answer so far (lowered when it
-        reaches its end node and by loop closers: closer = start node per row), stopping at stop nodes and not expanding
-        nodes beyond reach (B,): the sorted row * n + node keys of the nodes reached and their distances, in a hash table
-        within the budget."""
-        bound = torch.full((len(starts),), torch.inf, dtype=torch.float64, device=starts.device)
-        return ck.shortest_paths_sparse(self.indptr, self.dst, self.w[kind], starts, bound, self.delta[kind], self.n, active=active, blocked=blocked,
+        """Sparse delta-stepping, one start node per row: sorted keys row * n + node reached and their distances."""
+        return ck.shortest_paths_sparse(self.indptr, self.dst, self.w[kind], starts, self.delta[kind], self.n, active=active, blocked=blocked,
                                         stop=stop, end=end, closer=closer, reach=reach, max_slots=BUDGET // 32)
 
     def _walk_back(self, dist, starts, ends, reach=None, stop=None):
-        """Drift-weighted node paths start -> end per row (None where end < 0) in a dense (B, N) field or sorted (keys,
-        distances); predecessors beyond reach (B,) or stop nodes do not count."""
+        """Drift-weighted node paths start -> end per row from a dense or sparse dist, None where end < 0."""
         nodes, lengths = ck.trace_paths(self.in_ptr, self.in_tail, self.w_in["drift"], starts, ends, dist, self.n, reach=reach, stop=stop)
         lengths = lengths.cpu().numpy()
         return [p.tolist() if k else None for p, k in zip(np.split(nodes.cpu().numpy(), np.cumsum(lengths)[:-1]), lengths)]
@@ -259,10 +242,8 @@ class Queries:
         return torch.where(keys[pos] == k, kd[pos], torch.inf)
 
     def loops(self, sources, active, max_weight=None):
-        """FindLoop: per source the drift-weighted path back to a node linked to the source, choosing the closest such
-        node (the closing link's own weight does not count). The loop is returned without repeating the start. Loops
-        known to be short (max_weight: nodes farther are not expanded) are searched in hash tables, the others, which
-        reach much of the mesh, on dense (B, N) distance rows."""
+        """FindLoop: per source, the drift-weighted path to the closest node linking back to it (start not repeated).
+        Uncapped searches flood much of the mesh and run much faster on dense (B, N) rows than in hash tables."""
         out, c, step = [], 0, self.rows
         while c < len(sources):
             s = sources[c:c + step]
@@ -270,12 +251,11 @@ class Queries:
             if max_weight is None:
                 dist = torch.full((len(s), self.n), torch.inf, dtype=torch.float64, device=s.device)
                 dist[rows, s] = 0
-                ck.shortest_paths(self.indptr, self.dst, self.w["drift"], dist, rows * self.n + s, dist.new_full((len(s),), torch.inf),
-                                  self.delta["drift"], active=active, closer=s)
+                ck.shortest_paths(self.indptr, self.dst, self.w["drift"], dist, rows * self.n + s, self.delta["drift"],
+                                  active=active, closer=s)
             else:
                 dist = self._search(s, "drift", active, reach=torch.full((len(s),), max_weight, dtype=torch.float64, device=s.device), closer=s)
-                # the next chunk's results (about 32 bytes per node reached) should fit the budget: sized from this one and
-                # growing at most 4x, as the nodes reached per row vary
+                # next chunk: results (about 32 bytes per node reached) within the budget, growing at most 4x
                 step = max(1, min(4 * len(s), int(BUDGET * len(s) / (32 * max(1, len(dist[0]))))))
             u = self.closers[s]
             du = torch.where((u >= 0) & active[s][:, None], self._at(dist, rows[:, None].expand_as(u), u), torch.inf)
@@ -286,9 +266,8 @@ class Queries:
         return out
 
     def first_hit(self, sources, active, selected, max_weight=None):
-        """TraceDijkstraPath: drift-weighted path from each source to the closest selected node (the source itself
-        deselected), links over 45 degrees skipped, nodes beyond max_weight (per source) not expanded. None where
-        unreachable. These searches stop at the first receiver, so they run sparse."""
+        """TraceDijkstraPath: drift-weighted path per source to the closest other selected node, None where unreachable.
+        The searches stop at the first selected node, so they run sparse."""
         keys, kd = self._search(sources, "drift", active, stop=selected, reach=max_weight)
         q, v = keys // self.n, keys % self.n
         hit = selected[v] & (v != sources[q])
@@ -298,11 +277,9 @@ class Queries:
         return self._walk_back((keys, kd), sources, end, max_weight, selected)
 
     def between(self, starts, ends, active):
-        """GetSubSequence: shortest path over mesh-edge links from each start node to its end node, entering border
-        vertices only at the end, as concatenated nodes and offsets per row (empty where unreachable). The searches run
-        up to hop_reach; the rows the cap cut short are redone without it. Also returns what the searches leave in
-        xfield_tracer's shared distance array as (row, node, distance): every node settled before the end (closer, or as
-        close with a larger id) and every node those relax, or everything reached by a search without an end."""
+        """GetSubSequence: shortest mesh-edge paths start -> end as (nodes, offsets), entering borders only at the end.
+        Rows cut short by hop_reach are redone uncapped. Also returns the stale NodeDist writes (row, node, distance):
+        nodes settled before the end (closer, or tied with a larger id) and those they relax, or all if it is missed."""
         n, reach = self.n, self.hop_reach
         keys, kd = self._search(starts, "edge", active, end=ends, blocked=self.node_border,
                                 reach=torch.full((len(starts),), reach, dtype=torch.float64, device=starts.device))
@@ -328,8 +305,7 @@ class Queries:
         return paths, (wk // n, wk % n, wd)
 
     def _relax_once(self, q, v, d, active, ends):
-        """Mesh-edge links out of the settled (row q, node v, distance d) entries of GetSubSequence searches, expanded a
-        budget's worth of arcs (about 64 bytes each) at a time."""
+        """Mesh-edge relaxations (row, node, distance) out of settled between() entries, a budget of arcs at a time."""
         deg = self.indptr[v + 1] - self.indptr[v]
         ends_at = torch.cumsum(deg, 0)
         step = BUDGET // 64
@@ -345,23 +321,21 @@ class Queries:
         return tuple(torch.cat(t) for t in zip(*out))
 
     def distances(self, sources, active, dist=None):
-        """UpdateDistancesFrom: link-length distance from the nearest source (decrease-only when a previous field is
-        given). Nodes not reached stay +inf (or keep their previous value)."""
+        """UpdateDistancesFrom: link-length distance from the nearest source, only lowering dist if given.
+        One dense row: the sparse search has no multi-source mode."""
         dist = torch.full((self.n,), torch.inf, dtype=torch.float64, device=sources.device) if dist is None else dist.clone()
         dist[sources] = 0
-        ck.shortest_paths(self.indptr, self.dst, self.w["length"], dist.view(1, -1), sources, dist.new_full((1,), torch.inf),
-                          self.delta["length"], active=active)
+        ck.shortest_paths(self.indptr, self.dst, self.w["length"], dist.view(1, -1), sources, self.delta["length"], active=active)
         return dist
 
     def walk(self, sources, active, selected):
-        """TraceToSelected: from each source follow every node's smallest-angle link until a selected node; fails on a
-        node without links, an inactive one, or one already marked (visited nodes and their active reverses)."""
+        """TraceToSelected: per source, follow smallest-angle links to a selected node; None if the walk fails."""
         if not len(self.dst):
             return [None] * len(sources)
         nxt0 = torch.where(self.indptr[:-1] < self.indptr[1:], self.dst[self.indptr[:-1].clamp_max(len(self.dst) - 1)], -1)
         twin = torch.arange(self.n, device=sources.device) ^ 2
         out = []
-        for c in range(0, len(sources), 160 * self.rows):                  # a bit per node and walk
+        for c in range(0, len(sources), 160 * self.rows):                  # one visited bit per node and walk
             paths, k = ck.walk_successors(nxt0, sources[c:c + 160 * self.rows], selected, active=active, twin=twin)
             paths = paths.cpu().numpy()
             out += [paths[r, :x].tolist() if x else None for r, x in enumerate(k.tolist())]

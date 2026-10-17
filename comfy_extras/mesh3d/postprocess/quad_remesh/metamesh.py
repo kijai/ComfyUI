@@ -1,9 +1,5 @@
-"""QuadWild's trace removal on the patch layout (xfield_tracer MetaMesh::MergeLoop): every disk patch becomes a meta face,
-a cycle of meta edges between meta vertices (the corners of all patches and the feature vertices), and a trace is
-dissolved by merging the patches on its two sides whenever every side it bounds is removable (matched exactly by one
-side of one other patch, no feature vertex on it) and the merged layout is not worse (fewer non-disks, bad sizes and
-internal singularities, more matched singularities, fewer patches that are not Catmull-Clark-able). Traces are tried
-last to first until a full pass dissolves nothing; a pass skips the traces nothing changed around since they failed."""
+"""QuadWild's trace removal (xfield_tracer MetaMesh::MergeLoop): a trace is dissolved by merging the patches on its
+two sides when every side it bounds matches one side of one other patch and the merged patches score no worse."""
 from __future__ import annotations
 
 import numpy as np
@@ -13,8 +9,7 @@ _LISTS = ("V", "L", "adj", "pid", "real", "vdir")
 
 
 def catmull_clarkable(L, thr):
-    """IsCatmullClarkable with 4-sided patches skipped (catmull_clarkability.h): the side lengths admit a subdivision
-    of the patch pattern within slack thr."""
+    """IsCatmullClarkable (catmull_clarkability.h) within slack thr, with 4-sided patches skipped."""
     n = len(L)
     if n == 4:
         return True
@@ -90,8 +85,7 @@ class MetaMesh:
         for i, f in enumerate(self.faces):
             if f is not None:
                 self._check_adj(i)
-        # InitExpectedValence: the valence of a patch's single singularity (its side count when the singularity is a
-        # corner, -1 with several, 4 without), and the number of singularities off its corners
+        # InitExpectedValence: exp_val = the only singularity's valence (-1: several, 4: none); nsing = ones off corners
         pv = np.unique(np.repeat(tr.label, 3) * tr.nv + tr.F.reshape(-1))
         per = {}
         for key in pv[tr.valence[pv % tr.nv] != 4].tolist():
@@ -198,7 +192,7 @@ class MetaMesh:
         return True
 
     def _score(self, infos):
-        """BetterConfiguration with MinSides 3, MaxSides 5, slack avgEdge, valence matching and emitters counted."""
+        """BetterConfiguration (MinSides 3, MaxSides 5, slack avgEdge) as a tuple, lower is better."""
         return (sum(not x["genus"] for x in infos),
                 sum(not MIN_SIDES <= x["corners"] <= MAX_SIDES for x in infos),
                 max([1] + [x["nsing"] for x in infos]),
@@ -227,8 +221,7 @@ class MetaMesh:
         return True
 
     def _changed_paths(self):
-        """Paths whose removal could turn out differently after the last merge: those along a face it changed (before
-        or after) or along a face next to one. Failed attempts leave nothing behind, so other paths need no retry."""
+        """Paths along a face the last merge changed or next to one: only their removal can turn out differently."""
         out = set()
         for i, old in self._backup.items():
             for f in (old, self.faces[i]):

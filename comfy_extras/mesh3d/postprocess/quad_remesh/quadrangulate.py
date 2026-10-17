@@ -1,8 +1,5 @@
-"""Fill every patch with its quad pattern, a port of QuadRetopology's quadrangulate: the patch is mapped onto the pattern's
-regular polygon with its border fixed by arc length per subside (LSCM with a fully fixed border is the cotangent-harmonic
-map, solved for all patches at once), pattern vertices are located in that map and lifted to 3D, shared subside vertices
-are stitched, doublets and degenerate faces removed and the result projected back onto the triangle mesh. smooth() is
-QuadWild's final MultiCostraintSmooth."""
+"""Fill every patch with its quad pattern (QuadRetopology quadrangulate) through a cotangent-harmonic map of the patch
+onto the pattern's polygon, which is LSCM with a fixed border. smooth() is QuadWild's final MultiCostraintSmooth."""
 from __future__ import annotations
 
 import numpy as np
@@ -14,14 +11,13 @@ from .patterns import pattern
 
 
 def _harmonic(verts3d, tri, fixed, uv):
-    """uv (given on `fixed`, filled in place) with L uv = 0 on the free vertices for the cotangent Laplacian L: conjugate
-    gradients over the free vertices, the fixed ones moved to the right-hand side."""
+    """Fill uv in place on the free vertices with L uv = 0 for the cotangent Laplacian L, by conjugate gradients with
+    the fixed vertices moved to the right-hand side."""
     n = verts3d.shape[0]
     p = verts3d[tri]
     u, v = p.roll(-1, 1) - p, p.roll(-2, 1) - p
     cot = 0.5 * ((u * v).sum(2) / torch.linalg.cross(u, v).norm(dim=2).clamp_min(1e-20))
     c1, c2 = tri.roll(-1, 1), tri.roll(-2, 1)
-    # both directions of every edge, corner by corner
     i, j, w = (torch.stack([x.T, y.T], 1).reshape(-1) for x, y in ((c1, c2), (c2, c1), (cot, cot)))
     diag = row_sum(i, w, n)
     free = ~fixed
@@ -41,10 +37,8 @@ def _harmonic(verts3d, tri, fixed, uv):
 
 
 def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv: np.ndarray, device="cuda"):
-    """Quad mesh (vertices (V, 3) float64, quads (Q, 4), on the device) of the patterns of every chart, stitched along
-    the subsides and projected onto the triangle mesh."""
+    """Quad mesh of the chart patterns on the triangle mesh: vertices (V, 3) float64 and quads (Q, 4), on the device."""
     dev = torch.device(device)
-    # patterns and chart-local vertices
     pats, local_tris, local_vids, uv_fixed_idx, uv_fixed_val, base = [], [], [], [], [], 0
     for chart in charts:
         pat = pattern(tuple(int(sum(subdiv[s] for s in side.subsides)) for side in chart.sides))
@@ -61,7 +55,7 @@ def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv
                 ids = pat[2][i][start:start + n + 1]
                 walk.append((s, rev, ids))
                 a, b = pat[0][ids[0]], pat[0][ids[-1]]
-                acc = np.concatenate([[0.0], np.cumsum(sub.steps[::d])])[:-1] / max(sub.length, 1e-30)     # spaced by the quad size
+                acc = np.concatenate([[0.0], np.cumsum(sub.steps[::d])])[:-1] / max(sub.length, 1e-30)     # in local quad sizes
                 uv_fixed_idx.append(np.searchsorted(vids, sub.vertices[::d][:-1]) + base)
                 uv_fixed_val.append(a + (b - a) * acc[:, None])
                 start += n
@@ -78,7 +72,7 @@ def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv
     uv[idx] = T(np.concatenate(uv_fixed_val))
     uv = _harmonic(v3, tri, fixed, uv)
 
-    # locate pattern vertices: each chart's uv triangles live at their own height
+    # locate pattern vertices in the uv map, each chart lifted to its own height
     lift = 4.0 * T(np.repeat(np.arange(len(local_tris)), [len(t) for t in local_tris]))
     bvh = ck.mesh_bvh(torch.cat([uv[tri], lift[:, None, None].expand(-1, 3, 1)], 2).float())
     q = T(np.concatenate([np.c_[pat[0], np.full(len(pat[0]), 4.0 * k)] for k, (pat, _) in enumerate(pats)])).float()
@@ -93,8 +87,7 @@ def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv
     bary = bary / bary.sum(1, keepdim=True).clamp_min(1e-30)
     mapped = (bary[:, :, None] * v3[tri[hit]]).sum(1).cpu().numpy()
 
-    # stitch: patch corners first, then each subside's inner vertices once (averaged over its two patches), then the
-    # patch interiors
+    # stitch: corners, then each subside's inner vertices once (averaged over its two patches), then interiors
     corner_vertex = {v: k for k, v in enumerate(dict.fromkeys(v for sub in subsides for v in (sub.vertices[0], sub.vertices[-1])))}
     out_v = [verts[v] for v in corner_vertex]
     out_f, subside_verts, qoff = [], {}, 0
@@ -127,8 +120,8 @@ def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv
 
 
 def _remove_doublets(qf):
-    """Merge pairs of quads that share both edges at a vertex no other quad uses (QuadRetopology removeDoubletFaces,
-    repeated until none is left): the first quad takes the second one's corner opposite that vertex. Edits qf in place."""
+    """Merge quad pairs that share both edges at a vertex no other quad uses, until none is left (QuadRetopology
+    removeDoubletFaces). Edits qf in place."""
     alive = np.ones(len(qf), dtype=bool)
     merged = True
     while merged:
@@ -147,8 +140,8 @@ def _remove_doublets(qf):
 
 
 def _quad_templates(p):
-    """Square of each quad's area rigidly fitted to it in its PCA plane, then turned to the quad's normal (vcg
-    GetRotatedTemplatePos with isotropic GetPolyTemplatePos), the distortion sum|template - p|^2 / area, and the area."""
+    """Square of each quad's area fitted to it in its PCA plane and turned to its normal, the distortion
+    sum |template - p|^2 / area, and the area (vcg GetRotatedTemplatePos, isotropic GetPolyTemplatePos)."""
     def normal(q):
         n = torch.linalg.cross(q.roll(-1, 1) - q, q.roll(-2, 1) - q)
         n = (n / n.norm(dim=2, keepdim=True).clamp_min(1e-30)).sum(1)
@@ -179,8 +172,8 @@ def _quad_templates(p):
 
 
 def _back_projection(q, f, tri_v):
-    """Closest point of every triangle mesh vertex on the quads (fanned around their centres), each pulling the corners
-    of its quad weighted by its position in it: the mean pull per quad vertex and which vertices are pulled at all."""
+    """Mean pull per quad vertex, and whether it is pulled at all, from each triangle mesh vertex's offset to its
+    closest point on the quads, spread over that quad's corners by position."""
     p = q[f]
     centre = p.mean(1, keepdim=True).expand(-1, 4, 3)
     fan = torch.stack([p, p.roll(-1, 1), centre], 2).reshape(-1, 3, 3)
@@ -204,11 +197,9 @@ def _back_projection(q, f, tri_v):
 
 
 def smooth(q, f, verts, faces):
-    """QuadWild's MultiCostraintSmooth on a mesh without sharp features: 30 steps that each move every vertex halfway
-    towards 0.7 * the distortion-weighted average of its quads' fitted squares + 0.3 * the area-weighted average of its
-    quads' other corners (vcg SmoothPCA), then back project the triangle mesh onto the quads and reproject onto the
-    triangle mesh. Then 3 back projections along the vertex normals only and without the reprojection, so the quads fit
-    the surface instead of interpolating it at their corners. Border vertices stay put. Tensors on one device."""
+    """QuadWild's MultiCostraintSmooth without sharp features: 30 template/Laplacian steps (vcg SmoothPCA) with back
+    projection and reprojection, then 3 back projections along the normals only, so the quads fit the surface instead
+    of interpolating it at their corners. Border vertices stay put."""
     dev = q.device
     tri_v = verts.float()
     surf = ck.mesh_bvh(tri_v[faces])
