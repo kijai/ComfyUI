@@ -124,11 +124,12 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, output_dev
 
 class TAEHV(nn.Module):
     def __init__(self, latent_channels, parallel=False, encoder_time_downscale=(True, True, False), decoder_time_upscale=(False, True, True), decoder_space_upscale=(True, True, True),
-                 latent_format=None, show_progress_bar=False):
+                 latent_format=None, show_progress_bar=False, lq_channels=0):
         super().__init__()
         self.image_channels = 3
         self.patch_size = 1
         self.latent_channels = latent_channels
+        self.lq_channels = lq_channels
         self.parallel = parallel
         self.latent_format = latent_format
         self.is_h3 = self.latent_channels == 24
@@ -145,24 +146,31 @@ class TAEHV(nn.Module):
         else: # HunyuanVideo, Wan 2.1
             act_func = nn.ReLU(inplace=True)
 
-        self.encoder = nn.Sequential(
-            conv(self.image_channels*self.patch_size**2, 64), act_func,
-            TPool(64, 2 if encoder_time_downscale[0] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func),
-            TPool(64, 2 if encoder_time_downscale[1] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func),
-            TPool(64, 2 if encoder_time_downscale[2] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func),
-            conv(64, self.latent_channels),
-        )
         n_f = [256, 128, 64, 64]
+        deepen_in, deepen_out = [], []
+        if lq_channels: # FlashVSR TCDecoder: decoder only, conditioned on the low-quality frames
+            self.encoder = None
+            n_f = [512, 256, 128, 128]
+            deepen_in = [conv(n_f[0], n_f[0], bias=False), act_func]
+            deepen_out = [conv(n_f[3], n_f[3], bias=False), act_func]
+        else:
+            self.encoder = nn.Sequential(
+                conv(self.image_channels*self.patch_size**2, 64), act_func,
+                TPool(64, 2 if encoder_time_downscale[0] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func),
+                TPool(64, 2 if encoder_time_downscale[1] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func),
+                TPool(64, 2 if encoder_time_downscale[2] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func), MemBlock(64, 64, act_func),
+                conv(64, self.latent_channels),
+            )
 
         self.decoder = nn.Sequential(
-            Clamp(), conv(self.latent_channels, n_f[0]), act_func,
+            Clamp(), conv(self.latent_channels + lq_channels, n_f[0]), act_func, *deepen_in,
             MemBlock(n_f[0], n_f[0], act_func), MemBlock(n_f[0], n_f[0], act_func), MemBlock(n_f[0], n_f[0], act_func), nn.Upsample(scale_factor=2 if decoder_space_upscale[0] else 1), TGrow(n_f[0], 2 if decoder_time_upscale[0] else 1), conv(n_f[0], n_f[1], bias=False),
             MemBlock(n_f[1], n_f[1], act_func), MemBlock(n_f[1], n_f[1], act_func), MemBlock(n_f[1], n_f[1], act_func), nn.Upsample(scale_factor=2 if decoder_space_upscale[1] else 1), TGrow(n_f[1], 2 if decoder_time_upscale[1] else 1), conv(n_f[1], n_f[2], bias=False),
             MemBlock(n_f[2], n_f[2], act_func), MemBlock(n_f[2], n_f[2], act_func), MemBlock(n_f[2], n_f[2], act_func), nn.Upsample(scale_factor=2 if decoder_space_upscale[2] else 1), TGrow(n_f[2], 2 if decoder_time_upscale[2] else 1), conv(n_f[2], n_f[3], bias=False),
-            act_func, conv(n_f[3], self.image_channels*self.patch_size**2),
+            act_func, *deepen_out, conv(n_f[3], self.image_channels*self.patch_size**2),
         )
 
-        self.t_downscale = 2**sum(t.stride == 2 for t in self.encoder if isinstance(t, TPool))
+        self.t_downscale = 2**sum(encoder_time_downscale)
         self.t_upscale = 2**sum(t.stride == 2 for t in self.decoder if isinstance(t, TGrow))
         self.frames_to_trim = self.t_upscale - 1
         self._show_progress_bar = show_progress_bar
@@ -201,10 +209,23 @@ class TAEHV(nn.Module):
                                         patch_size=self.patch_size).movedim(2, 1)
         return self.process_out(x)
 
-    def decode(self, x, **kwargs):
+    def lq_condition(self, lq_images, x):
+        # 4x8x8 pixel-unshuffled low-quality frames, the first one repeated to fill its group
+        if lq_images is None:
+            raise ValueError("The FlashVSR TCDecoder needs the upscaled low-quality frames, decode with the FlashVSR Decode node.")
+        b, t, _, h, w = x.shape
+        lq = lq_images[..., :3].movedim(-1, 0).unsqueeze(0).to(device=x.device, dtype=x.dtype) * 2.0 - 1.0
+        lq = lq[:, :, :4 * t - 3, :h * 8, :w * 8]
+        lq = F.pad(lq, (0, w * 8 - lq.shape[-1], 0, h * 8 - lq.shape[-2], 3, 4 * t - 3 - lq.shape[-3]), mode="replicate")
+        lq = lq.reshape(1, 3, t, 4, h, 8, w, 8).permute(0, 2, 1, 3, 5, 7, 4, 6).reshape(1, t, self.lq_channels, h, w)
+        return lq.expand(b, -1, -1, -1, -1)
+
+    def decode(self, x, lq_images=None, **kwargs):
         x = x.unsqueeze(0) if x.ndim == 4 else x  # [T, C, H, W] -> [1, T, C, H, W]
         x = x.movedim(1, 2) if x.shape[1] != self.latent_channels else x  # [B, T, C, H, W] or [B, C, T, H, W]
         x = self.process_in(x).movedim(2, 1)  # [B, C, T, H, W] -> [B, T, C, H, W]
+        if self.lq_channels:
+            x = torch.cat([self.lq_condition(lq_images, x), x], dim=2)
         if self.is_h3:
             single_frame = x.shape[1] == 1
         x = apply_model_with_memblocks(self.decoder, x, self.parallel, self.show_progress_bar,

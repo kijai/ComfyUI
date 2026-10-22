@@ -1459,6 +1459,57 @@ class Wan22ImageToVideoLatent(io.ComfyNode):
         return io.NodeOutput(out_latent)
 
 
+class FlashVSRConditioning(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FlashVSRConditioning",
+            category="model/conditioning/wan",
+            description="Conditioning and empty latent for FlashVSR video upscaling, sample with 1 step at cfg 1.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Image.Input("images", tooltip="The low-quality video, already resized to the output resolution (FlashVSR was trained on bicubic upscaling)."),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, images) -> io.NodeOutput:
+        context = model.model.diffusion_model.positive_conditioning
+        positive = [[context.unsqueeze(0), {"lq_images": images}]]
+        length, height, width = images.shape[:3]
+        # whole chunks and 128 px windows so the sampler noises the padding like upstream, FlashVSR Decode crops it
+        latent = torch.zeros([1, 16, ((length + 2) // 16 + 1) * 4, math.ceil(height / 128) * 16, math.ceil(width / 128) * 16], device=comfy.model_management.intermediate_device())
+        return io.NodeOutput(positive, {"samples": latent})
+
+
+class FlashVSRDecode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FlashVSRDecode",
+            category="latent",
+            description="Decode FlashVSR latents with the TCDecoder, which also reads the upscaled low-quality frames.",
+            inputs=[
+                io.Vae.Input("vae"),
+                io.Latent.Input("samples"),
+                io.Image.Input("images", tooltip="The same upscaled low-quality video given to FlashVSR Conditioning."),
+            ],
+            outputs=[
+                io.Image.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, vae, samples, images) -> io.NodeOutput:
+        decoded = vae.decode(samples["samples"], vae_options={"lq_images": images})
+        decoded = decoded.reshape(-1, *decoded.shape[-3:])
+        return io.NodeOutput(decoded[:images.shape[0], :images.shape[1], :images.shape[2]].clamp(0.0, 1.0))
+
+
 from comfy.ldm.wan.model_multitalk import InfiniteTalkOuterSampleWrapper, MultiTalkCrossAttnPatch, MultiTalkGetAttnMapPatch, project_audio_features
 class WanInfiniteTalkToVideo(io.ComfyNode):
     class DCValues(TypedDict):
@@ -1646,6 +1697,8 @@ class WanExtension(ComfyExtension):
             WanAnimate2Cache,
             Wan22ImageToVideoLatent,
             WanInfiniteTalkToVideo,
+            FlashVSRConditioning,
+            FlashVSRDecode,
         ]
 
 async def comfy_entrypoint() -> WanExtension:
