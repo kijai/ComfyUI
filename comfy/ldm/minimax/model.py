@@ -480,7 +480,7 @@ class MiniMaxH3Model(nn.Module):
                  timestep_input_dim=256, time_embed_hidden_size=5376, time_embed_dim=2688,
                  rope_inv_freq_len=16, norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5,
                  sigma_shift_video=12.0, sigma_shift_audio=3.0,
-                 adaln_curve_grid=None, gate_compress=False, pdd_steps=1,
+                 adaln_curve_grid=None, gate_compress=False, pdd_steps=1, endpoint_time_embed=False,
                  image_model=None, dtype=None, device=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
@@ -491,6 +491,7 @@ class MiniMaxH3Model(nn.Module):
         self.sigma_shift_video = sigma_shift_video
         self.sigma_shift_audio = sigma_shift_audio
         self.use_adaln_curves = adaln_curve_grid is not None
+        self.two_time = endpoint_time_embed
         # curve-form checkpoints replace the time embedder and full-width adaln weights with a small shared basis of the time-embedding curve
         curve = {"apply_silu": not self.use_adaln_curves,
                  "adaln_dtype": torch.float32 if self.use_adaln_curves else dtype}
@@ -502,8 +503,14 @@ class MiniMaxH3Model(nn.Module):
         if self.use_adaln_curves:
             self.register_buffer("adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=torch.float32))
         else:
+            # two-time embedders cancel large output weights and must stay fp32, which quantized-checkpoint ops would drop
+            time_ops = comfy.ops.manual_cast if self.two_time else operations
             self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim,
-                                              dtype=torch.float32, device=device, operations=operations)
+                                              dtype=torch.float32, device=device, operations=time_ops)
+            if self.two_time:
+                # embeds the step endpoint r; the checkpoint folds the (t, r) gate into both projections
+                self.endpoint_time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim,
+                                                           dtype=torch.float32, device=device, operations=time_ops)
         self.rope = nn.Module()
         self.rope.register_buffer("inv_freq", torch.empty(rope_inv_freq_len, dtype=torch.float32))
         self.token_refiner = TokenRefiner(token_refiner_num_layers, hidden_size, num_attention_heads,
@@ -674,13 +681,22 @@ class MiniMaxH3Model(nn.Module):
         sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
         t_v = float(1.0 - sigma_v)
         t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
+        # rows are labeled (t, r): two-time checkpoints also embed the step endpoint r = 1 - sigma_next, others use r = t
+        sigma_n = sigma_v
+        if self.two_time:
+            sample_sigmas = transformer_options["sample_sigmas"]
+            i = int((sample_sigmas - sigma_v).abs().argmin())
+            sigma_n = sample_sigmas[min(i + 1, sample_sigmas.shape[0] - 1)]
+        r_v = float(1.0 - sigma_n)
+        r_a = float(1.0 - time_shift_sigma(sigma_n, shift_v, shift_a))
 
-        # distinct timesteps are known analytically: text/pad follow video, cond rows pin near 1
+        # distinct timesteps are known analytically: text/pad follow video, cond rows pin near 1 and hold (r = t)
         vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
         aud_aug = float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP))
         seg_t = {"text": t_v, "video": t_v, "audio": t_a,
                  "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
                  "cond_audio": max(t_a, aud_aug), "ref_audio": max(t_a, aud_aug)}
+        seg_r = dict(seg_t, text=r_v, video=r_v, audio=r_a)
 
         # masked rows run at their own strength: mask value m puts a row at sigma = m * sigma_stream,
         # so its label is 1 - m * sigma, clamped at the cond timestep for fully preserved rows
@@ -692,37 +708,38 @@ class MiniMaxH3Model(nn.Module):
             m = mask_row_values(denoise_mask[0, 0].to(torch.float32), latent_t, lat_h, lat_w)
             if m is not None:
                 rows_t = (1.0 - m * sigma_v.to(m.device)).clamp(max=t_pin_v)
+                rows_r = (1.0 - m * sigma_n.to(m.device)).clamp(max=t_pin_v)
                 if rows_t.unique().numel() == 1:
-                    seg_t["video"] = float(rows_t[0])
+                    seg_t["video"], seg_r["video"] = float(rows_t[0]), float(rows_r[0])
                 else:
-                    video_rows_t = rows_t
+                    video_rows_t = torch.stack((rows_t, rows_r), -1)
         if audio_denoise_mask is not None:
             m = audio_denoise_mask[0, 0].to(torch.float32).reshape(-1)
             if not bool((m >= 1.0 - 1e-3).all()):
-                sigma_a = 1.0 - t_a
-                rows_t = (1.0 - m * sigma_a).clamp(max=t_pin_a)
+                rows_t = (1.0 - m * (1.0 - t_a)).clamp(max=t_pin_a)
+                rows_r = (1.0 - m * (1.0 - r_a)).clamp(max=t_pin_a)
                 if rows_t.unique().numel() == 1:
-                    seg_t["audio"] = float(rows_t[0])
+                    seg_t["audio"], seg_r["audio"] = float(rows_t[0]), float(rows_r[0])
                 else:
-                    audio_rows_t = rows_t
+                    audio_rows_t = torch.stack((rows_t, rows_r), -1)
 
-        unique_t = sorted({t_v, t_a} | {seg_t[k] for _, _, k in layout.segments}
-                          | (set(video_rows_t.unique().tolist()) if video_rows_t is not None else set())
-                          | (set(audio_rows_t.unique().tolist()) if audio_rows_t is not None else set()))
+        unique_t = sorted({(t_v, r_v), (t_a, r_a)} | {(seg_t[k], seg_r[k]) for _, _, k in layout.segments}
+                          | ({tuple(p) for p in video_rows_t.unique(dim=0).tolist()} if video_rows_t is not None else set())
+                          | ({tuple(p) for p in audio_rows_t.unique(dim=0).tolist()} if audio_rows_t is not None else set()))
         t_row = {t: i for i, t in enumerate(unique_t)}
         seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "cond_audio": 2, "ref_audio": 2}
 
         def rows_to_mod_index(rows_t, tag):
-            # per-row timestep values -> per-row mod-row indices into the t_emb table
-            levels = rows_t.unique()
-            base = torch.tensor([t_row[v] * 3 + tag for v in levels.tolist()],
+            # per-row (t, r) pairs -> per-row mod-row indices into the t_emb table
+            levels, inverse = rows_t.unique(dim=0, return_inverse=True)
+            base = torch.tensor([t_row[tuple(v)] * 3 + tag for v in levels.tolist()],
                                 dtype=torch.long, device=rows_t.device)
-            return base[torch.searchsorted(levels, rows_t)]
+            return base[inverse]
 
         text_tags = payload.get("text_token_tags")
         mod_segments = []
         for a, b, kind in layout.segments:
-            row_base = t_row[seg_t[kind]] * 3
+            row_base = t_row[(seg_t[kind], seg_r[kind])] * 3
             if kind == "text" and text_tags is not None:
                 # the presentation text span mixes tags (vision pads carry the video modality) split into tag runs
                 tags = text_tags.view(-1).tolist()
@@ -740,7 +757,7 @@ class MiniMaxH3Model(nn.Module):
 
         h = self._embed_and_pack(video_x, audio_x, context, layout, payload, transformer_options)
 
-        t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
+        t_vals = torch.tensor([t for t, _ in unique_t], dtype=torch.float32, device=device)
         if self.use_adaln_curves:
             # adaln projections consume interpolated coordinates of the time-embedding curve
             table = comfy.model_management.cast_to(self.adaln_t_table, device=device)
@@ -748,7 +765,10 @@ class MiniMaxH3Model(nn.Module):
             i0 = pos.floor().long().clamp(max=table.shape[0] - 2)   # lower grid row, max-clamp keeps t=1.0 on the last interval instead of reading past the table
             t_emb = torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))  # blend the two rows by the fractional part
         else:
-            t_emb = self.time_embedder(t_vals).to(dtype)
+            t_emb = self.time_embedder(t_vals)
+            if self.two_time:
+                t_emb = t_emb + self.endpoint_time_embedder(torch.tensor([r for _, r in unique_t], dtype=torch.float32, device=device))
+            t_emb = t_emb.to(dtype)
 
         # rotation table computed once per forward, consumed by the kitchen split-half rope
         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
@@ -778,11 +798,11 @@ class MiniMaxH3Model(nn.Module):
         if video_rows_t is not None:
             video_seg = (va, vb, rows_to_mod_index(video_rows_t, 0) // 3)
         else:
-            video_seg = (va, vb, t_row[seg_t["video"]])
+            video_seg = (va, vb, t_row[(seg_t["video"], seg_r["video"])])
         if audio_rows_t is not None:
             audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3)
         else:
-            audio_seg = (aa, ab, t_row[seg_t["audio"]])
+            audio_seg = (aa, ab, t_row[(seg_t["audio"], seg_r["audio"])])
         v, a = self.final_layer(h, t_emb, video_seg, audio_seg, sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
 
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
