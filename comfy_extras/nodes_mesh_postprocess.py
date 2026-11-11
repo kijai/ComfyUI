@@ -2958,19 +2958,19 @@ class QuadRemeshMesh(IO.ComfyNode):
     def execute(cls, mesh, target_quads, alpha, adaptive_size):
         compute_device = comfy.model_management.get_torch_device()
         _prepare_gpu_mesh_processing(compute_device, 2 ** 31 + _mesh_face_count(mesh) * 8192)
-        counts = {"in": 0, "out": 0}
+        quads = 0
 
         def _fn(v, f, c):
-            counts["in"] += int(f.shape[0])
+            nonlocal quads
             qv, qf = quad_remesh(v.to(compute_device).double(), f.to(compute_device).long(), int(target_quads), float(alpha),
                                  float(adaptive_size))
-            counts["out"] += int(qf.shape[0])
+            quads += int(qf.shape[0])
             tri = _quads_to_triangles(qv, qf)
             return qv.to(device=v.device, dtype=v.dtype), tri.to(device=v.device, dtype=torch.int32), None
 
         result = _process_mesh_batch(mesh, _fn)
         if cls.hidden.unique_id:
-            PromptServer.instance.send_progress_text(f"quads: {_fmt_count(counts['out'])}", cls.hidden.unique_id)
+            PromptServer.instance.send_progress_text(f"quads: {_fmt_count(quads)}", cls.hidden.unique_id)
         return result
 
 

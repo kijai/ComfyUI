@@ -86,9 +86,8 @@ def _make_even(charts, subsides, s, quad, target):
     return s
 
 
-def quantize(charts, subsides, edge_length: float, alpha: float = 0.05, device="cpu", start: np.ndarray | None = None) -> np.ndarray:
+def quantize(charts, subsides, edge_length: float, alpha: float, dev, start: np.ndarray | None = None) -> np.ndarray:
     """Even-perimeter subdivision of every subside, by subside id, searched from start or else the rounded targets."""
-    dev = torch.device(device)
     active = [ci for ci, c in enumerate(charts) if len(c.faces)]
     nside = np.array([len(charts[ci].sides) for ci in active])
     if ((nside < 3) | (nside > 6)).any():

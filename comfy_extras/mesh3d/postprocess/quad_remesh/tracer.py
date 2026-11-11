@@ -23,6 +23,15 @@ TRACE_STEPS = 7                                                        # progres
 TIP_REACH = 4                                                          # tip ring search radius, in average edges
 
 
+def _unit(x):
+    return x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-300)
+
+
+def face_cross(P, F):
+    """Each triangle's normal, twice its area long."""
+    return np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]])
+
+
 @dataclass
 class Trace:
     nodes: list
@@ -53,7 +62,7 @@ class Tracer:
         self.ne = len(uk)                                                   # eid: undirected edge id per half-edge
         self.wedge = self._wedge_angles(self.P)
         self.avg_edge = float(np.linalg.norm(self.P[self.head] - self.P[self.tail], axis=1).mean())
-        area = 0.5 * np.linalg.norm(np.cross(self.P[F[:, 1]] - self.P[F[:, 0]], self.P[F[:, 2]] - self.P[F[:, 0]]), axis=1)
+        area = 0.5 * np.linalg.norm(face_cross(self.P, F), axis=1)
         self.max_weight = np.sqrt(np.bincount(self.comp_f, weights=area, minlength=self.ncomp)) * MAX_NARROW_CONST * DRIFT   # MaxNarrowWeight per component
 
         self._eid = self._tensor(self.eid)
@@ -101,8 +110,7 @@ class Tracer:
         """Set border half-edge field directions and lengths (EdgeDirectionTable::AddBorder, InitEdgeL)."""
         bh = np.nonzero(self.opp < 0)[0]
         a, b = self.tail[bh], self.head[bh]
-        u = self.P[b] - self.P[a]
-        u /= np.maximum(np.linalg.norm(u, axis=1, keepdims=True), 1e-300)
+        u = _unit(self.P[b] - self.P[a])
         self.tdir[bh], self.hdir[bh] = self.closest_dir(a, u), self.closest_dir(b, -u)
         self.elen[bh] = np.linalg.norm(self.P[b] - self.P[a], axis=1)
         return bh, a, b, u
@@ -111,17 +119,15 @@ class Tracer:
         """Per border edge end, sorted by vertex: the vertex, the edge's inward normal rotated into the vertex frame and
         the border direction continued past it (GetOrthoFlatDirections). Also the inward normals summed per vertex."""
         bh, a, b, u = self.border_table()
-        fn = np.cross(self.P[self.F[:, 1]] - self.P[self.F[:, 0]], self.P[self.F[:, 2]] - self.P[self.F[:, 0]])
-        fn /= np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-300)
+        fn = _unit(face_cross(self.P, self.F))
         f = np.repeat(fn[bh // 3], 2, 0)
         o = np.cross(f, np.repeat(u, 2, 0))
         verts = np.stack([a, b], 1).reshape(-1)
         c = (f * self.vn[verts]).sum(1, keepdims=True)
-        k = np.cross(f, self.vn[verts])
-        k /= np.maximum(np.linalg.norm(k, axis=1, keepdims=True), 1e-300)
+        k = _unit(np.cross(f, self.vn[verts]))
         phi = np.arccos(np.clip(c, -1, 1))
         r = np.where(c > 1 - 1e-9, o, o * np.cos(phi) + np.cross(k, o) * np.sin(phi) + k * (k * o).sum(1, keepdims=True) * (1 - np.cos(phi)))
-        ortho = r / np.maximum(np.linalg.norm(r, axis=1, keepdims=True), 1e-300)
+        ortho = _unit(r)
         order = np.argsort(verts, kind="stable")
         osum = np.zeros((self.nv, 3))
         np.add.at(osum, verts[order], ortho[order])
@@ -140,14 +146,14 @@ class Tracer:
         self.vtype[possible & (vert_a > np.pi)] = CONCAVE
         self.emitter, self.receiver = np.full(self.n, NONE, dtype=np.int64), np.full(self.n, NONE, dtype=np.int64)
         fv = np.nonzero(self.vtype == FLAT)[0]
-        e = self.closest_dir(fv, osum[fv] / np.maximum(np.linalg.norm(osum[fv], axis=1, keepdims=True), 1e-300))
+        e = self.closest_dir(fv, _unit(osum[fv]))
         self.emitter[4 * fv + e], self.receiver[4 * fv + (e + 2) % 4] = FLAT, FLAT
         cv = np.nonzero(self.vtype == CONCAVE)[0]
         i = np.searchsorted(bv, cv)
         e0, e1 = self.closest_dir(cv, ortho[i]), self.closest_dir(cv, ortho[i + 1])
         # with opposite inward normals, also emit along the border continued past the vertex
         c = cont[i] + cont[i + 1]
-        e2 = np.where(e1 == (e0 + 2) % 4, self.closest_dir(cv, c / np.maximum(np.linalg.norm(c, axis=1, keepdims=True), 1e-300)), e0)
+        e2 = np.where(e1 == (e0 + 2) % 4, self.closest_dir(cv, _unit(c)), e0)
         for e in (e0, e1, e2):
             self.emitter[4 * cv + e], self.receiver[4 * cv + (e + 2) % 4] = CONCAVE, CONCAVE
         self.needs = np.where(self.vtype == CONCAVE, np.maximum((self.emitter.reshape(-1, 4) != NONE).sum(1) - 1, 1), 0)
@@ -247,14 +253,14 @@ class Tracer:
         cnt = np.zeros((len(keys), 4), dtype=np.int64)
         np.add.at(cnt, (inv, np.concatenate([self.dir_at(hs, a), self.dir_at(hs, b)])), 1)
         corner = ((cnt[:, 0::2].sum(1) > 0) & (cnt[:, 1::2].sum(1) > 0)) | (cnt > 1).any(1)
-        ck = np.unique(np.concatenate([keys[corner], pv[self.vtype[pv % nv] == CONVEX]]))
-        concave = self.vtype[ck % nv] == CONCAVE
+        found = np.unique(np.concatenate([keys[corner], pv[self.vtype[pv % nv] == CONVEX]]))
+        concave = self.vtype[found % nv] == CONCAVE
         if concave.any():
             keys_a, inv_a = np.unique(np.repeat(lab[fi], 3) * nv + self.F[fi].reshape(-1), return_inverse=True)
             sums = np.bincount(inv_a, weights=self.wedge[fi].reshape(-1))
-            pos = np.searchsorted(keys_a, ck).clip(max=len(keys_a) - 1)
-            ck = ck[~(concave & (sums[pos] > np.pi))]
-        return ck
+            pos = np.searchsorted(keys_a, found).clip(max=len(keys_a) - 1)
+            found = found[~(concave & (sums[pos] > np.pi))]
+        return found
 
     def _patch_types(self, hs, parts, comp, pv, pe):
         """Validity type of each new patch in parts (PatchInfo + UpdatePartitionType)."""
@@ -343,8 +349,7 @@ class Tracer:
         a = np.nonzero(nxt >= 0)[0]
         a, b = nodes[a], nodes[nxt[a]]
         va, vb = a // 4, b // 4
-        dsum = self.dirs[va, a % 4] + self.dirs[vb, b % 4]
-        dsum /= np.maximum(np.linalg.norm(dsum, axis=1, keepdims=True), 1e-300)
+        dsum = _unit(self.dirs[va, a % 4] + self.dirs[vb, b % 4])
         fl = ((self.P[vb] - self.P[va]) * dsum).sum(1)
         fwd = self.he_of(va, vb)
         for h, x, y in ((fwd, a % 4, (b % 4 + 2) % 4), (self.he_of(vb, va), (b % 4 + 2) % 4, a % 4)):

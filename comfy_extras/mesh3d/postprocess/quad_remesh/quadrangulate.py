@@ -36,12 +36,16 @@ def _harmonic(verts3d, tri, fixed, uv):
     return uv
 
 
-def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv: np.ndarray, device="cuda"):
-    """Quad mesh of the chart patterns on the triangle mesh: vertices (V, 3) float64 and quads (Q, 4), on the device."""
-    dev = torch.device(device)
+def chart_pattern(chart, subdiv):
+    """Quad patch of a chart whose subsides are subdivided by subdiv, or None."""
+    return pattern(tuple(int(sum(subdiv[s] for s in side.subsides)) for side in chart.sides))
+
+
+def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv: np.ndarray, dev):
+    """Quad mesh of the chart patterns on the triangle mesh: vertices (V, 3) float64 and quads (Q, 4), on dev."""
     pats, local_tris, local_vids, uv_fixed_idx, uv_fixed_val, base = [], [], [], [], [], 0
     for chart in charts:
-        pat = pattern(tuple(int(sum(subdiv[s] for s in side.subsides)) for side in chart.sides))
+        pat = chart_pattern(chart, subdiv)
         if pat is None:
             continue
         vids, inv = np.unique(faces[chart.faces], return_inverse=True)

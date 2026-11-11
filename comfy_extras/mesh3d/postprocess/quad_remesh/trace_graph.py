@@ -210,7 +210,7 @@ class Queries:
         indeg = torch.bincount(g.dst, minlength=self.n)
         self.in_ptr = torch.cat([indeg.new_zeros(1), torch.cumsum(indeg, 0)]).int()
         self.in_tail = src[order].int()
-        self.w_in = {k: w[order] for k, w in self.w.items()}
+        self.w_in = {k: self.w[k][order] for k in ("drift", "edge")}
         node, slot = _ranges(torch.zeros_like(indeg), indeg)
         self.closers = torch.full((self.n, int(indeg.max())), -1, dtype=torch.long, device=dev)
         self.closers[node, slot] = torch.where(torch.isfinite(self.w_in["drift"]), src[order], -1)   # nodes a loop may close from
