@@ -13,30 +13,37 @@ from ..qem_decimate import _repair_nonmanifold_edges, _split_touching_sheets, qe
 from ..remesh import remesh_narrow_band_dc
 from .charts import compute_chart_data
 from .field import cross_field, opposite_halfedges
-from .quadrangulate import chart_pattern, quadrangulate, smooth
+from .quadrangulate import chart_pattern, fit_diagonals, quadrangulate, smooth, surface_colors
 from .quantize import quantize
 from .tracer import TRACE_STEPS, face_cross, trace_patches
 
-# quads per (area / edge length^2) of QuadWild layouts, the first guess before the count is measured
-_QUADS_PER_EDGE_AREA = 3.5
+# opposite singularities closer than the square root of this many mean quad areas are cancelled
+_CANCEL_AREAS = 3.5
 # fewest quads the patterns of a 3/4/5/6-sided patch take
 _MIN_QUADS = {3: 3, 4: 1, 5: 5, 6: 6}
+# quads beyond those minimums per (area / edge length^2), the first guess before the count is measured
+_QUADS_PER_EDGE_AREA = 1.15
 # decimation target of the tracing mesh: max(_WORK_FACES, _WORK_FACES_PER_QUAD * target_quads) faces
 _WORK_FACES, _WORK_FACES_PER_QUAD = 170_000, 8
 # Remesh Mesh (solid) resolution for inputs that are not closed manifold surfaces
 _SOLID_RESOLUTION = 256
 
 
-def _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick):
-    """Quads of the traced layout for the relative quad size per vertex, with the count fitted to target_quads."""
+def _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick, fit):
+    """Quads of the traced layout for the relative quad size per vertex, with the count fitted to target_quads. The
+    search starts at fit, (edge length over its first guess, subdivisions over each subside's target or None for the
+    rounded targets); the fit found is returned too, as the start for another size field on the same layout."""
     dev = verts.device
-    area = 0.5 * np.linalg.norm(face_cross(P, F), axis=1)
-    edge = math.sqrt(_QUADS_PER_EDGE_AREA * (area / size[F].mean(1) ** 2).sum() / target_quads)
     charts, subsides = compute_chart_data(P, F, label, corners, size)
-    s = quantize(charts, subsides, edge, alpha, dev)
-    tick()
-    # count ~ a / edge^2 + floor, where floor is the patterns' minimum: fit a to the last count and solve again
+    lengths = np.array([sub.length for sub in subsides])
+    # count ~ a / edge^2 + floor, where floor is the patterns' minimum and a is first guessed from the area
     floor = sum(_MIN_QUADS.get(len(c.sides), 0) for c in charts if len(c.faces))
+    area = 0.5 * np.linalg.norm(face_cross(P, F), axis=1)
+    guess = math.sqrt(_QUADS_PER_EDGE_AREA * (area / size[F].mean(1) ** 2).sum() / max(target_quads - floor, target_quads / 10))
+    edge = fit[0] * guess
+    s = quantize(charts, subsides, edge, alpha, dev, start=None if fit[1] is None else np.maximum(1, np.rint(fit[1] * lengths / edge)))
+    tick()
+    # fit a to the last count and solve again
     for _ in range(2):
         pats = [chart_pattern(c, s) for c in charts if len(c.faces)]
         count = sum(len(pat[1]) for pat in pats if pat is not None)
@@ -51,7 +58,7 @@ def _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick):
     # fit to the input surface, not the tracer's smoothed copy, which has already lost its tips
     qv = smooth(qv, qf, verts, faces)
     tick()
-    return qv, qf
+    return qv, qf, (edge / guess, s * edge / np.maximum(lengths, 1e-30))
 
 
 def _error_size(P, F, qv, qf, target_quads, adaptive):
@@ -85,8 +92,10 @@ def _working_mesh(verts, faces, target_quads):
     return verts, faces, work_v, work_f
 
 
-def quad_remesh(verts: torch.Tensor, faces: torch.Tensor, target_quads: int, alpha: float, adaptive_size: float):
-    """Quad mesh ((V, 3) float64, (Q, 4)) on the input device; adaptive_size (0..1) adds an error-sized second pass."""
+def quad_remesh(verts: torch.Tensor, faces: torch.Tensor, target_quads: int, alpha: float, adaptive_size: float,
+                colors: torch.Tensor | None):
+    """Quad mesh ((V, 3) float64, (Q, 4), the input's vertex colors on it or None) on the input device, each quad best
+    split from its corner 0 to corner 2; adaptive_size (0..1) adds an error-sized second pass."""
     steps = 1 + TRACE_STEPS + (8 if adaptive_size > 0 else 4)
     pbar, tq = comfy.utils.ProgressBar(steps), tqdm(total=steps, desc="Quad remesh", leave=False)
 
@@ -94,16 +103,16 @@ def quad_remesh(verts: torch.Tensor, faces: torch.Tensor, target_quads: int, alp
         pbar.update(1)
         tq.update(1)
 
-    verts, faces, work_v, work_f = _working_mesh(verts, faces, target_quads)
+    fit_v, fit_f, work_v, work_f = _working_mesh(verts, faces, target_quads)
     tri = work_v[work_f]
     total = float(torch.linalg.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]).norm(dim=1).sum()) / 2
-    # singularity pairs closer than about a quad edge only cost patches: the field cancels them
-    field = cross_field(work_v, work_f, math.sqrt(_QUADS_PER_EDGE_AREA * total / target_quads))
+    # singularity pairs closer than about two quad edges only cost patches: the field cancels them
+    field = cross_field(work_v, work_f, math.sqrt(_CANCEL_AREAS * total / target_quads))
     tick()
     P, F, label, corners = trace_patches(work_v, work_f, field, progress_callback=tick)
-    qv, qf = _quads(P, F, label, corners, np.ones(len(P)), verts, faces, target_quads, alpha, tick)
+    qv, qf, fit = _quads(P, F, label, corners, np.ones(len(P)), fit_v, fit_f, target_quads, alpha, tick, (1.0, None))
     if adaptive_size > 0:
         size = _error_size(P, F, qv, qf, target_quads, adaptive_size)
-        qv, qf = _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick)
+        qv, qf, _ = _quads(P, F, label, corners, size, fit_v, fit_f, target_quads, alpha, tick, fit)
     tq.close()
-    return qv, qf
+    return qv, fit_diagonals(qv, qf, fit_v, fit_f), None if colors is None else surface_colors(qv, verts, faces, colors)

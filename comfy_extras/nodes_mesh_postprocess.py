@@ -2918,15 +2918,6 @@ class RemeshMesh(IO.ComfyNode):
         return result
 
 
-def _quads_to_triangles(v, q):
-    """Two triangles per quad, split along its shorter diagonal."""
-    d02 = (v[q[:, 0]] - v[q[:, 2]]).norm(dim=1)
-    d13 = (v[q[:, 1]] - v[q[:, 3]]).norm(dim=1)
-    a = torch.stack([q[:, 0], q[:, 1], q[:, 2], q[:, 0], q[:, 2], q[:, 3]], 1)
-    b = torch.stack([q[:, 0], q[:, 1], q[:, 3], q[:, 1], q[:, 2], q[:, 3]], 1)
-    return torch.where((d02 <= d13)[:, None], a, b).view(-1, 3)
-
-
 class QuadRemeshMesh(IO.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -2962,11 +2953,12 @@ class QuadRemeshMesh(IO.ComfyNode):
 
         def _fn(v, f, c):
             nonlocal quads
-            qv, qf = quad_remesh(v.to(compute_device).double(), f.to(compute_device).long(), int(target_quads), float(alpha),
-                                 float(adaptive_size))
+            qv, qf, qc = quad_remesh(v.to(compute_device).double(), f.to(compute_device).long(), int(target_quads), float(alpha),
+                                     float(adaptive_size), None if c is None else c.to(compute_device))
             quads += int(qf.shape[0])
-            tri = _quads_to_triangles(qv, qf)
-            return qv.to(device=v.device, dtype=v.dtype), tri.to(device=v.device, dtype=torch.int32), None
+            tri = qf[:, [0, 1, 2, 0, 2, 3]].reshape(-1, 3)
+            return (qv.to(device=v.device, dtype=v.dtype), tri.to(device=v.device, dtype=torch.int32),
+                    None if qc is None else qc.to(v.device))
 
         result = _process_mesh_batch(mesh, _fn)
         if cls.hidden.unique_id:

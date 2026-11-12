@@ -175,6 +175,16 @@ def _quad_templates(p):
     return b + v + wv + k[:, None, None] * torch.linalg.cross(w.expand_as(v), wv), quality, pa
 
 
+def _barycentric(p, tri):
+    """Barycentric coordinates of each p in its triangle (N, 3, 3), none below zero."""
+    v0, v1, v2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], p - tri[:, 0]
+    d00, d01, d11 = (v0 * v0).sum(1), (v0 * v1).sum(1), (v1 * v1).sum(1)
+    d20, d21 = (v2 * v0).sum(1), (v2 * v1).sum(1)
+    den = (d00 * d11 - d01 * d01).clamp_min(1e-30)
+    b1, b2 = (d11 * d20 - d01 * d21) / den, (d00 * d21 - d01 * d20) / den
+    return torch.stack([1 - b1 - b2, b1, b2], 1).clamp_min(0)
+
+
 def _back_projection(q, f, tri_v):
     """Mean pull per quad vertex, and whether it is pulled at all, from each triangle mesh vertex's offset to its
     closest point on the quads, spread over that quad's corners by position."""
@@ -182,14 +192,8 @@ def _back_projection(q, f, tri_v):
     centre = p.mean(1, keepdim=True).expand(-1, 4, 3)
     fan = torch.stack([p, p.roll(-1, 1), centre], 2).reshape(-1, 3, 3)
     _, cp, hit = ck.closest_point_on_mesh(ck.mesh_bvh(fan.float()), tri_v)
-    tri = fan[hit]
     cp = cp.double()
-    v0, v1, v2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], cp - tri[:, 0]
-    d00, d01, d11 = (v0 * v0).sum(1), (v0 * v1).sum(1), (v1 * v1).sum(1)
-    d20, d21 = (v2 * v0).sum(1), (v2 * v1).sum(1)
-    den = (d00 * d11 - d01 * d01).clamp_min(1e-30)
-    b1, b2 = (d11 * d20 - d01 * d21) / den, (d00 * d21 - d01 * d20) / den
-    bary = torch.stack([1 - b1 - b2, b1, b2], 1).clamp_min(0)
+    bary = _barycentric(cp, fan[hit])
     quad, corner = hit // 4, hit % 4
     one_hot = torch.nn.functional.one_hot
     wq = bary[:, 2:3] / 4 + bary[:, :1] * one_hot(corner, 4) + bary[:, 1:2] * one_hot((corner + 1) % 4, 4)
@@ -229,3 +233,20 @@ def smooth(q, f, verts, faces):
         n = torch.nn.functional.normalize(n, dim=1, eps=1e-30)
         q = torch.where(fixed | ~pulled[:, None], q, q + (pull * n).sum(1, keepdim=True) * n)
     return q
+
+
+def fit_diagonals(q, f, verts, faces):
+    """The quads with their corners turned so that the diagonal from corner 0 to corner 2 is the one whose midpoint is
+    closer to the surface: two triangles split along it follow the surface better than the other pair."""
+    p = q[f]
+    mid = torch.stack([p[:, 0] + p[:, 2], p[:, 1] + p[:, 3]], 1).reshape(-1, 3) / 2
+    d = ck.closest_point_on_mesh(ck.mesh_bvh(verts.float()[faces]), mid.float())[0].view(-1, 2)
+    return torch.where((d[:, 1] < d[:, 0])[:, None], f.roll(-1, 1), f)
+
+
+def surface_colors(q, verts, faces, colors):
+    """The surface's vertex colors at the point closest to each q."""
+    tri = verts.float()[faces]
+    _, cp, hit = ck.closest_point_on_mesh(ck.mesh_bvh(tri), q.float())
+    bary = _barycentric(cp, tri[hit])
+    return ((bary / bary.sum(1, keepdim=True).clamp_min(1e-30)).to(colors)[:, :, None] * colors[faces[hit]]).sum(1)
