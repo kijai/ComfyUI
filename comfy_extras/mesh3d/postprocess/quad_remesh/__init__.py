@@ -23,6 +23,8 @@ _CANCEL_AREAS = 3.5
 _MIN_QUADS = {3: 3, 4: 1, 5: 5, 6: 6}
 # quads beyond those minimums per (area / edge length^2), the first guess before the count is measured
 _QUADS_PER_EDGE_AREA = 1.15
+# least alpha of the error-sized second pass: with less, patches stay regular instead of following the sizes
+_ADAPTIVE_ALPHA = 0.2
 # decimation target of the tracing mesh: max(_WORK_FACES, _WORK_FACES_PER_QUAD * target_quads) faces
 _WORK_FACES, _WORK_FACES_PER_QUAD = 170_000, 8
 # Remesh Mesh (solid) resolution for inputs that are not closed manifold surfaces
@@ -63,14 +65,15 @@ def _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick, 
 
 def _error_size(P, F, qv, qf, target_quads, adaptive):
     """Second-pass quad size per vertex, (e / median(e)) ** (-0.7 adaptive) clipped to [0.5, 1.5] ** (2 adaptive), where
-    e is the surface's distance to the first pass's quads averaged over about a quad."""
+    e is the surface's distance to the first pass's quads averaged over about four quads: quad counts are set per
+    patch side and cannot follow anything finer."""
     quads = qv.float()[qf][:, [0, 1, 2, 0, 2, 3]].reshape(-1, 3, 3)
     err = ck.closest_point_on_mesh(ck.mesh_bvh(quads), torch.as_tensor(P, dtype=torch.float32, device=qv.device))[0].double().cpu().numpy()
     area = 0.5 * np.linalg.norm(face_cross(P, F), axis=1).sum()
     a, b = F.reshape(-1), np.roll(F, -1, 1).reshape(-1)
     deg = np.bincount(a, minlength=len(P))
     # n neighbour averages spread over about sqrt(n) edges
-    for _ in range(int(min(200, area / target_quads / np.linalg.norm(P[b] - P[a], axis=1).mean() ** 2))):
+    for _ in range(int(min(800, 4 * area / target_quads / np.linalg.norm(P[b] - P[a], axis=1).mean() ** 2))):
         err = (err + np.bincount(a, weights=err[b], minlength=len(P))) / (1 + deg)
     return np.clip((np.maximum(err, 1e-12) / np.median(err)) ** (-0.7 * adaptive), 0.5 ** (2 * adaptive), 1.5 ** (2 * adaptive))
 
@@ -95,7 +98,7 @@ def _working_mesh(verts, faces, target_quads):
 def quad_remesh(verts: torch.Tensor, faces: torch.Tensor, target_quads: int, alpha: float, adaptive_size: float,
                 colors: torch.Tensor | None):
     """Quad mesh ((V, 3) float64, (Q, 4), the input's vertex colors on it or None) on the input device, each quad best
-    split from its corner 0 to corner 2; adaptive_size (0..1) adds an error-sized second pass."""
+    split from its corner 0 to corner 2; adaptive_size (0..2) adds an error-sized second pass."""
     steps = 1 + TRACE_STEPS + (8 if adaptive_size > 0 else 4)
     pbar, tq = comfy.utils.ProgressBar(steps), tqdm(total=steps, desc="Quad remesh", leave=False)
 
@@ -113,6 +116,6 @@ def quad_remesh(verts: torch.Tensor, faces: torch.Tensor, target_quads: int, alp
     qv, qf, fit = _quads(P, F, label, corners, np.ones(len(P)), fit_v, fit_f, target_quads, alpha, tick, (1.0, None))
     if adaptive_size > 0:
         size = _error_size(P, F, qv, qf, target_quads, adaptive_size)
-        qv, qf, _ = _quads(P, F, label, corners, size, fit_v, fit_f, target_quads, alpha, tick, fit)
+        qv, qf, _ = _quads(P, F, label, corners, size, fit_v, fit_f, target_quads, max(alpha, _ADAPTIVE_ALPHA), tick, fit)
     tq.close()
     return qv, fit_diagonals(qv, qf, fit_v, fit_f), None if colors is None else surface_colors(qv, verts, faces, colors)

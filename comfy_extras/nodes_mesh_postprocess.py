@@ -2937,9 +2937,10 @@ class QuadRemeshMesh(IO.ComfyNode):
                 IO.Float.Input("alpha", default=0.05, min=0.0, max=1.0, step=0.01, advanced=True,
                                tooltip="Higher follows the target quad size more closely, lower gives fewer "
                                        "irregular vertices."),
-                IO.Float.Input("adaptive_size", default=0.5, min=0.0, max=1.0, step=0.05, advanced=True,
+                IO.Float.Input("adaptive_size", default=0.5, min=0.0, max=10.0, step=0.05, advanced=True,
                                tooltip="Smaller quads where detail needs them and larger ones elsewhere, at the same "
-                                       "total count. 0 keeps quads evenly sized."),
+                                       "total count. 0 keeps quads evenly sized; above 1 the contrast keeps growing "
+                                       "but the surface is followed less closely."),
             ],
             outputs=[IO.Mesh.Output("mesh")],
             hidden=[IO.Hidden.unique_id],
