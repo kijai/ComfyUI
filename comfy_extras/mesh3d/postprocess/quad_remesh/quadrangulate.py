@@ -124,20 +124,28 @@ def quadrangulate(verts: np.ndarray, faces: np.ndarray, charts, subsides, subdiv
 
 
 def _remove_doublets(qf):
-    """Merge quad pairs that share both edges at a vertex no other quad uses, until none is left (QuadRetopology
-    removeDoubletFaces). Edits qf in place."""
+    """Merge quad pairs that share both edges at a vertex, until none is left (QuadRetopology removeDoubletFaces).
+    Besides doublets, whose vertex no other quad uses, such a pair can wrap a vertex that other quads also use, where
+    a patch's pattern joins two of its border vertices that a neighbour joins too; pairs on the same four corners
+    enclose nothing and are dropped. Edits qf in place."""
     alive = np.ones(len(qf), dtype=bool)
     merged = True
     while merged:
         fi = np.nonzero(alive)[0]
-        corners = qf[fi].reshape(-1)
-        at = np.nonzero(np.bincount(corners)[corners] == 2)[0]
+        q = qf[fi]
+        prv, nxt = np.roll(q, 1, 1), np.roll(q, -1, 1)
+        # corners (flat face*4+k) by vertex and its two neighbours: equal keys share both edges there
+        key = np.stack([q, np.minimum(prv, nxt), np.maximum(prv, nxt)], 2).reshape(-1, 3)
+        order = np.lexsort(key.T[::-1])
+        pair = (key[order[1:]] == key[order[:-1]]).all(1)
         merged = False
-        # the two corners (flat face*4+k) at each such vertex
-        for a, b in at[np.argsort(corners[at], kind="stable")].reshape(-1, 2).tolist():
+        for a, b in zip(order[:-1][pair].tolist(), order[1:][pair].tolist()):
             f, g, j, k = fi[a // 4], fi[b // 4], a % 4, b % 4
-            if alive[f] and alive[g] and {qf[f][j - 1], qf[f][(j + 1) % 4]} == {qf[g][k - 1], qf[g][(k + 1) % 4]}:
-                qf[f][j] = qf[g][(k + 2) % 4]
+            if alive[f] and alive[g] and qf[f][j] == qf[g][k] and {qf[f][j - 1], qf[f][(j + 1) % 4]} == {qf[g][k - 1], qf[g][(k + 1) % 4]}:
+                if qf[g][(k + 2) % 4] == qf[f][(j + 2) % 4]:
+                    alive[f] = False
+                else:
+                    qf[f][j] = qf[g][(k + 2) % 4]
                 alive[g] = False
                 merged = True
     return qf[alive]

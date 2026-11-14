@@ -27,8 +27,8 @@ _QUADS_PER_EDGE_AREA = 1.15
 _ADAPTIVE_ALPHA = 0.2
 # decimation target of the tracing mesh: max(_WORK_FACES, _WORK_FACES_PER_QUAD * target_quads) faces
 _WORK_FACES, _WORK_FACES_PER_QUAD = 170_000, 8
-# Remesh Mesh (solid) resolution for inputs that are not closed manifold surfaces
-_SOLID_RESOLUTION = 256
+# Remesh Mesh (solid) resolution for inputs that are not closed manifold surfaces, and the smoothing of its voxel steps
+_SOLID_RESOLUTION, _SOLID_SMOOTHING = 256, 10
 
 
 def _quads(P, F, label, corners, size, verts, faces, target_quads, alpha, tick, fit):
@@ -79,16 +79,26 @@ def _error_size(P, F, qv, qf, target_quads, adaptive):
 
 
 def _working_mesh(verts, faces, target_quads):
-    """Surface to fit the quads to and mesh to trace on. Inputs with open or non-manifold edges are remeshed as Remesh
-    Mesh (solid); for tracing, a surface over twice the needed faces is decimated and touching sheets split apart."""
-    if bool((opposite_halfedges(faces) < 0).any()):
-        v, f, _ = remesh_narrow_band_dc(verts.float(), faces, resolution=_SOLID_RESOLUTION, sign_mode="solid", qef=False,
-                                        drop_inverted_components=False, drop_enclosed_components=False)
-        verts, faces = v.double(), f.long()
+    """Surface to fit the quads to and mesh to trace on. Inputs with open or non-manifold edges get coincident vertices
+    merged, as files keep them split along UV seams, and are traced on a smoothed Remesh Mesh (solid): on its voxel
+    steps the field and the layout staircase along thin diagonal parts. The quads are fitted to that remesh with its
+    vertices within a cell of the input moved onto it; openings, gaps it closes and details finer than a cell stay
+    smooth, as quads fitted into them crumple. For tracing, a surface over twice the needed faces is decimated and
+    touching sheets split apart."""
     work_v, work_f = verts, faces
+    if bool((opposite_halfedges(faces) < 0).any()):
+        verts, inv = torch.unique(verts, dim=0, return_inverse=True)
+        faces = inv[faces]
+        v, f, _ = remesh_narrow_band_dc(verts.float(), faces, resolution=_SOLID_RESOLUTION, sign_mode="solid", qef=False,
+                                        smooth_iters=_SOLID_SMOOTHING, drop_inverted_components=False,
+                                        drop_enclosed_components=False)
+        work_v, work_f = v.double(), f.long()
+        cell = 1.1 * float((verts.max(0).values - verts.min(0).values).max()) / _SOLID_RESOLUTION      # as the remesh's
+        d, near, _ = ck.closest_point_on_mesh(ck.mesh_bvh(verts.float()[faces]), v)
+        verts, faces = torch.where((d <= cell)[:, None], near, v).double(), work_f
     limit = max(_WORK_FACES, _WORK_FACES_PER_QUAD * target_quads)
-    if faces.shape[0] > 2 * limit:
-        v, f, _ = qem_simplify(verts.float(), faces, limit)
+    if work_f.shape[0] > 2 * limit:
+        v, f, _ = qem_simplify(work_v.float(), work_f, limit)
         work_v, work_f = v.double(), f.long()
     work_f, src = _split_touching_sheets(work_v, work_f)
     work_v, work_f, _ = _repair_nonmanifold_edges(work_v[src], work_f)
